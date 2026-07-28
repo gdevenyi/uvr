@@ -1,6 +1,6 @@
 # uv feature parity — design
 
-Status: draft — awaiting approval
+Status: approved 2026-07-27 (@nbafrank) — implementation plans follow, one PR per feature
 Author: gdevenyi
 Date: 2026-07-23
 
@@ -8,9 +8,9 @@ Date: 2026-07-23
 
 Audit uvr's feature set against [`uv`](https://github.com/astral-sh/uv) and close the
 gaps that a real R developer's workflow needs — reshaped to R idioms rather than
-copied literally. This document is the umbrella design; each accepted feature gets a
-companion forgejo-grade implementation plan under
-`docs/superpowers/plans/2026-07-23-uv-parity-NN-*.md`.
+copied literally. This document is the umbrella design; each accepted feature then gets
+its own forgejo-grade implementation plan (`docs/design/2026-07-23-uv-parity-NN-*.md`),
+submitted **one PR per feature** rather than as a pre-approved batch.
 
 Six features are in scope, in three priority tiers:
 
@@ -19,7 +19,7 @@ Six features are in scope, in three priority tiers:
 | P0 | F0 | Shell activation | `source .venv/bin/activate` |
 | P0 | F1 | Inline per-script dependencies | PEP 723 `# /// script` |
 | P0 | F5 | Private-repo authentication | `uv auth` / index credentials |
-| P1 | F3 | Dependency sources (path / git-host / url) | `[tool.uv.sources]` |
+| P1 | F3 | Dependency sources (path / generic git / url) | `[tool.uv.sources]` |
 | P1 | F6 | Ergonomic parity commands | `cache prune/dir/size`, `python dir/find` |
 | P2 | F4 | Resolution controls | `--resolution`, `--exclude-newer`, overrides/constraints |
 
@@ -58,7 +58,7 @@ The full uv surface, each row judged against the governing principle. Verdicts:
 | `uv self version` | `uvr --version` | PARITY | |
 | `uv generate-shell-completion` | `uvr completions` | PARITY | |
 | script inline metadata (PEP 723) | — (only `--with`) | BUILD (F1) | The headline gap; live edge over `rv`. |
-| `[tool.uv.sources]` git (any host) | GitHub + Forgejo only | BUILD (F3) | Closes #123 (GitLab). |
+| `[tool.uv.sources]` git (any host) | GitHub + Forgejo; GitLab in flight (#174) | BUILD (F3) | #174 covers the `gitlab::` slice of #123; generic `git::` remains. |
 | `[tool.uv.sources]` path | — | BUILD (F3) | |
 | `[tool.uv.sources]` url | — | BUILD (F3) | |
 | `[tool.uv.sources]` editable / workspace | — | EXCLUDE | No R live-reload of installed libs; devtools owns it. Workspaces cut. |
@@ -400,7 +400,9 @@ returned `Credential` becomes an `Authorization` header (`Bearer <t>` or Basic).
 - Custom-registry index fetch — `sync.rs:104-127` (`fetch_custom_registries`).
 - Package tarball download — `crates/uvr-core/src/installer/download.rs:305` (the same
   host-scoped-never-forwarded discipline the Forgejo path already uses at `download.rs:318`).
-- Git-host DESCRIPTION + tarball fetches (GitLab/Bitbucket added in F3 reuse this).
+- Git-host DESCRIPTION + tarball fetches. GitHub, Forgejo, and GitLab (#174) each roll
+  their own env-token lookup today; F5 unifies them behind `auth::resolve`, and F3's
+  generic `git::` uses it from the start.
 
 ### Touched files
 
@@ -433,85 +435,105 @@ returned `Credential` becomes an `Authorization` header (`Bearer <t>` or Basic).
 ### Goal
 
 Extend the sources a single dependency can declare to match real R workflows: a **local
-path**, an **arbitrary git host** (GitLab/Bitbucket/generic — closing #123), and a
-**direct URL tarball**. Reuses the source-install path and generalizes the
-Forgejo-established `<kind>::` prefix scheme.
+path**, an **arbitrary git host**, and a **direct URL tarball**. Reuses the
+source-install path and generalizes the Forgejo-established `<kind>::` prefix scheme.
+
+### Relationship to in-flight work (#174)
+
+PR [#174](https://github.com/nbafrank/uvr/pull/174) (@pteridin) implements the GitLab
+slice in exactly the `gitlab::` shape this design specifies, mirroring `forgejo.rs`. F3
+therefore **builds on #174 rather than re-specifying GitLab**; the remaining slices are
+**path**, **url**, and **generic `git::`**.
+
+Status check (2026-07-27): #174 is **open, not merged** — upstream `main` is at `5dfdafb`
+(v0.4.3 prep) with no GitLab commit — and its author notes *"Extensive testing was not
+performed (TBD)."* F3's plan therefore opens by **verifying #174 against a real GitLab
+project**, and treats its merge as a precondition.
+
+Two corrections #174 forces on the data model as originally drafted here:
+
+1. The lockfile variant is spelled **`Gitlab { host }`** (not `GitLab`), serializing as
+   `"gitlab:<host>"`.
+2. GitLab namespaces **nest arbitrarily deep** (`host/group/subgroup/project`), unlike
+   GitHub's and Forgejo's fixed `host/owner/repo`. `parse_gitlab_parts` already handles
+   variable depth; no later `<kind>::` resolver may assume three segments. (#174 also
+   strips GitLab's `?sha=…` query string when deriving archive filenames.)
 
 ### Non-goals
 
 - Editable / live-reload installs (R installs are compiled/copied; `devtools::load_all()`
   owns that loop).
 - Workspaces / multi-package monorepos.
+- **A dedicated Bitbucket REST resolver** — generic `git::` covers Bitbucket
+  functionally. Add one only if demand appears.
 
 ### Syntax
 
 ```toml
 [dependencies]
-# local path (relative to uvr.toml, or absolute)
+# local path (relative to uvr.toml, or absolute)            — F3
 mypkg   = { path = "../mypkg" }
-# arbitrary git host — new prefixes join github/forgejo
-gpkg    = { git = "gitlab::gitlab.com/group/repo",  rev = "v1.2.0" }
-bpkg    = { git = "bitbucket::bitbucket.org/team/repo", rev = "main" }
+# GitLab, incl. nested groups                               — #174
+gpkg    = { git = "gitlab::gitlab.com/group/subgroup/repo", rev = "v1.2.0" }
+# any other git host, via a clone URL                       — F3
 anypkg  = { git = "git::https://git.corp.example/team/repo.git", rev = "abc123" }
-# direct source tarball
+# direct source tarball                                     — F3
 tpkg    = { url = "https://example.org/tpkg_1.2.0.tar.gz" }
 ```
 
 CLI: `uvr add ../mypkg` (path sniffed by leading `.`/`/` or existing dir),
-`uvr add gitlab::group/repo@ref`, `uvr add https://…/pkg_1.2.tar.gz`.
+`uvr add git::https://…/repo.git@ref`, `uvr add https://…/pkg_1.2.tar.gz`.
 
 ### Data model
 
 `DetailedDep` (`crates/uvr-core/src/manifest.rs:81-97`) gains two fields; `git` accepts
-new prefixes:
+the new generic prefix:
 
 ```rust
 pub struct DetailedDep {
     pub version: Option<String>,
     pub bioc: Option<bool>,
-    pub git: Option<String>,   // "user/repo" | "forgejo::…" | NEW "gitlab::…" | "bitbucket::…" | "git::<url>"
+    pub git: Option<String>,   // "user/repo" | "forgejo::…" | "gitlab::…" (#174) | NEW "git::<url>"
     pub rev: Option<String>,
     pub path: Option<String>,  // NEW — local source dir
     pub url: Option<String>,   // NEW — direct source tarball
 }
 ```
 
-`PackageSource` (`crates/uvr-core/src/lockfile.rs:62-78`) — new variants, and the
-currently-unused `Local` gains a payload:
+`PackageSource` (`crates/uvr-core/src/lockfile.rs:62-78`) — F3 adds three variants on top
+of #174's, and the currently-unused `Local` gains a payload:
 
 ```rust
 pub enum PackageSource {
     Cran, Bioconductor, GitHub,
-    Forgejo  { host: String },
-    GitLab   { host: String },   // NEW  ("gitlab:<host>")
-    Bitbucket{ host: String },   // NEW  ("bitbucket:<host>")
-    Git      { url: String },    // NEW  generic ("git:<url>")
-    Url,                          // NEW  ("url"; tarball in LockedPackage.url)
-    Local    { path: String },   // CHANGED from unit → carries path ("local:<path>")
-    Custom   { name: String },
+    Forgejo { host: String },
+    Gitlab  { host: String },   // #174 ("gitlab:<host>")
+    Git     { url: String },    // NEW  generic ("git:<url>")
+    Url,                        // NEW  ("url"; tarball in LockedPackage.url)
+    Local   { path: String },   // CHANGED from unit → carries path ("local:<path>")
+    Custom  { name: String },
 }
 ```
 
 Reproducibility notes recorded in the spec and surfaced to users:
 
-- **GitLab/Bitbucket** mirror `forgejo.rs`: REST API for ref→SHA + raw DESCRIPTION +
-  archive tarball; lock stores the resolved SHA in `checksum` (`git:<sha>`) and the
-  archive URL in `url` — fully reproducible.
 - **`git::<url>`** (generic host): resolve via `git ls-remote` + a shallow `git archive`
   / clone; lock the SHA. Requires a `git` binary (documented; `uvr doctor` checks it).
 - **`url`** tarball: lock the URL + a `sha256` checksum — fully reproducible.
 - **`path`**: lock `source = "local:<path>"`; **not cross-machine reproducible** (the path
   may not exist elsewhere, and local edits aren't checksummed) — the same caveat renv
   carries. `uvr sync --frozen` warns when a lock contains a `Local` entry.
+- GitLab (per #174) stores the resolved SHA in `checksum` and the archive URL in `url`,
+  matching the Forgejo precedent — fully reproducible.
 
 ### Behavior
 
-- `parse_add_spec` (`add.rs:11-44`) grows branches: path (leading `.`/`/` or extant dir),
-  the new git prefixes (before the bare-`user/repo` GitHub heuristic), and `url`
-  (`https?://…(.tar.gz|.tgz)`). The current hard rejection of non-GitHub hosts
-  (`add.rs:51-57`) is replaced by dispatch.
-- The lock-time BFS (`lock.rs`, `resolve_git_deps`) gains GitLab/Bitbucket/generic arms
-  alongside the existing github/forgejo dispatch.
+- `parse_add_spec` (`add.rs:11-44`, as extended by #174) grows branches: path (leading
+  `.`/`/` or extant dir), `git::` (before the bare-`user/repo` GitHub heuristic), and
+  `url` (`https?://…(.tar.gz|.tgz)`).
+- The lock-time BFS (`lock.rs`, `resolve_git_deps`) gains a generic-git arm alongside the
+  existing github/forgejo/gitlab dispatch. Note #174's `parse_gitlab_remotes` returns
+  *all* git-bearing `Remotes:` entries, so cross-host chains keep working.
 - Install: `url`/git-archive/path all resolve to a source tarball (or dir) fed to the
   existing source-install path; `select_pkg_plan` (`sync.rs:57-95`) still prefers a P3M
   binary for CRAN names and falls back to these source URLs otherwise.
@@ -521,22 +543,23 @@ Reproducibility notes recorded in the spec and surfaced to users:
 
 | File | Change |
 |---|---|
-| `crates/uvr-core/src/manifest.rs:81-97` | `path` + `url` fields; parse/serialize; `[[dependencies]]` round-trip. |
-| `crates/uvr-core/src/lockfile.rs:62-78` | New `PackageSource` variants; `Local` → `Local { path }`; (de)serialize. |
-| `crates/uvr-core/src/registry/gitlab.rs`, `bitbucket.rs`, `git_generic.rs` *(new)* | Resolvers mirroring `forgejo.rs`. |
-| `crates/uvr-core/src/registry/mod.rs` | Register new modules. |
-| `crates/uvr/src/commands/add.rs:11-57` | Path/url/git-prefix dispatch; drop non-GitHub rejection. |
+| `crates/uvr-core/src/manifest.rs:81-97` | `path` + `url` fields; parse/serialize; round-trip. |
+| `crates/uvr-core/src/lockfile.rs:62-78` | `Git { url }`, `Url`; `Local` → `Local { path }`; (de)serialize. |
+| `crates/uvr-core/src/registry/git_generic.rs` *(new)* | `git ls-remote` / archive resolver. |
+| `crates/uvr-core/src/registry/mod.rs` | Register the new module. |
+| `crates/uvr/src/commands/add.rs:11-57` | Path / url / `git::` dispatch. |
 | `crates/uvr/src/commands/lock.rs` | BFS dispatch for the new kinds. |
 | `crates/uvr/src/commands/sync.rs:57-95,~1512-1536` | `source_url`/`select_pkg_plan` handle new variants; populate `Local { path }`. |
 | `crates/uvr/src/commands/export.rs` | Map new variants to the nearest renv `RemoteType`. |
 
 ### Tests
 
-- Spec parse for each new kind (path/gitlab/bitbucket/git::/url), including CLI sniffing.
+- Spec parse for each new kind (path / `git::` / url), including CLI sniffing.
 - Lockfile round-trip for every new `PackageSource` variant (+ malformed → `Custom` fallback, per the Forgejo precedent).
 - Path dep: install from a fixture source dir; `--frozen` emits the non-reproducible warning.
 - URL dep: checksum mismatch is a hard error.
-- GitLab resolver against a `mockito` server (ref→SHA→DESCRIPTION→tarball URL).
+- Generic `git::` resolver against a local bare-repo fixture (no network).
+- Regression: #174's GitLab specs still parse, lock, and export unchanged.
 
 ---
 
@@ -710,7 +733,9 @@ Each excluded with a one-line rationale, designed *not* to be built:
 ## Priority & sequencing
 
 Build order and rationale. F5's credential layer lands before F3 so the private-git-host
-half of F3 reuses it; the shared `REnv` refactor is a prerequisite for F0 and F1.
+half of F3 reuses it; the shared `REnv` refactor is a prerequisite for F0 and F1. Each
+feature ships as its **own plan PR**, reviewed and merged before the next is written —
+no pre-approved batch.
 
 1. **F0 Shell activation** (P0) — you requested it; high interactive-adoption value;
    self-contained once the `REnv` refactor lands.
@@ -718,7 +743,8 @@ half of F3 reuses it; the shared `REnv` refactor is a prerequisite for F0 and F1
    + `ensure_with_env`.
 3. **F5 Private-repo auth** (P0) — unblocks the corporate/university audience; supplies
    the credential layer F3 depends on.
-4. **F3 Dependency sources** (P1) — real workflows + #123; reuses F5's auth.
+4. **F3 Dependency sources** (P1) — path / url / generic `git::`, on top of #174's GitLab
+   slice; reuses F5's auth. Blocked on #174 merging.
 5. **F6 Ergonomics** (P1) — cheap wins; independent.
 6. **F4 Resolution controls** (P2) — full breadth by request; lowest demand, most
    resolver-invasive, so last.

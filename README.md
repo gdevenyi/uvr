@@ -338,7 +338,8 @@ You are wondrous!
 ```
 
 The `-S` flag needs GNU coreutils 8.30+ on Linux; macOS and the BSDs have
-supported it for years.
+supported it for years. Windows has no shebang mechanism, so the line is
+inert there and the script runs as `uvr run hooray`.
 
 ---
 

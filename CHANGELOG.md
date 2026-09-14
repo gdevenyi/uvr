@@ -7,6 +7,19 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **`uvr r install` rewrites the stale build-time `R_HOME_DIR` in the
+  `bin/R` wrapper to the installation's real path** (#271). The portable
+  builds leave the build machine's path (a `/Library/Frameworks/...`
+  framework directory on macOS) on the wrapper's first assignment and only
+  recompute it at runtime, so tools that read the wrapper as text resolved
+  the interpreter to an R that isn't there — Positron either failed to
+  start uvr-managed R or silently launched a different version against the
+  project's library. The rewrite is inert for shell execution (the runtime
+  override recomputes the same value) and only corrects what static
+  readers see. Applies to new installs; refresh an existing version with
+  `uvr r uninstall <ver> && uvr r install <ver>`. Reported with a
+  verified one-line diagnosis by @Felixmil.
+
 - **GitHub dependencies can select an R package in a repository
   subdirectory, directly or through transitive DESCRIPTION `Remotes:`** (#244).
   Direct declarations use

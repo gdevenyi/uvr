@@ -295,6 +295,58 @@ fn test_manifest_with_an_unknown_strategy_is_rejected() {
 }
 
 #[test]
+fn test_exclude_newer_flag_is_offered_on_lock() {
+    uvr_cmd()
+        .args(["lock", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--exclude-newer <DATE>"));
+}
+
+#[test]
+fn test_exclude_newer_flag_rejects_dates_without_a_snapshot() {
+    // #194: clap refuses the date before any network access.
+    let dir = init_project("baddate");
+    for (date, why) in [
+        ("2024-02-30", "expected YYYY-MM-DD"),
+        ("2017-01-01", "before 2017-10-10"),
+        ("2999-01-01", "in the future"),
+    ] {
+        uvr_cmd()
+            .args(["lock", "--exclude-newer", date])
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(why));
+    }
+}
+
+#[test]
+fn test_frozen_sync_resolves_at_the_manifest_exclude_newer_date() {
+    // #194: `sync --frozen` re-resolves with `[resolution] exclude-newer`.
+    // A date with no snapshot fails that re-resolve before any network
+    // access, which shows the date is read; `uvr lock` checks it too.
+    let dir = init_project("frozendate");
+    let toml_path = dir.path().join("uvr.toml");
+    let mut toml = fs::read_to_string(&toml_path).unwrap();
+    toml.push_str("\n[resolution]\nexclude-newer = \"2017-01-01\"\n");
+    fs::write(&toml_path, toml).unwrap();
+    fs::write(
+        dir.path().join("uvr.lock"),
+        "[r]\nversion = \"4.5.1\"\nresolved_as_of = \"2017-01-01\"\n",
+    )
+    .unwrap();
+    for args in [&["sync", "--frozen"][..], &["lock"][..]] {
+        uvr_cmd()
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("exclude-newer date 2017-01-01"));
+    }
+}
+
+#[test]
 fn test_sync_without_lockfile_fails() {
     let dir = init_project("no-lock-test");
     uvr_cmd()

@@ -32,12 +32,19 @@ pub struct Manifest {
     pub resolution: Option<ResolutionConfig>,
 }
 
-/// `[resolution]` — how dependencies are resolved. Later resolver knobs
-/// (`exclude-newer`, …) are further fields here.
+/// `[resolution]` — how dependencies are resolved.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ResolutionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<ResolutionStrategy>,
+
+    /// Resolve CRAN as it stood on this date (`YYYY-MM-DD`, #194).
+    #[serde(
+        default,
+        rename = "exclude-newer",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exclude_newer: Option<String>,
 }
 
 /// Which end of each allowed version range the resolver picks (#193).
@@ -296,6 +303,11 @@ impl Manifest {
             .as_ref()
             .and_then(|r| r.strategy)
             .unwrap_or_default()
+    }
+
+    /// The `[resolution] exclude-newer` date, if set.
+    pub fn exclude_newer(&self) -> Option<&str> {
+        self.resolution.as_ref()?.exclude_newer.as_deref()
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
@@ -1451,6 +1463,7 @@ bioc = true
         let m: Manifest = canonical.parse().expect("parse");
         assert_eq!(m.resolution, None);
         assert_eq!(m.resolution_strategy(), ResolutionStrategy::Highest);
+        assert_eq!(m.exclude_newer(), None);
         assert_eq!(m.to_toml_string().expect("serialize"), canonical);
     }
 
@@ -1470,6 +1483,17 @@ bioc = true
             .parse()
             .expect("parse");
         assert_eq!(m.resolution_strategy(), ResolutionStrategy::Highest);
+    }
+
+    #[test]
+    fn exclude_newer_round_trip() {
+        // #194: the date sits beside the strategy, under its kebab-case key.
+        let toml = "[project]\nname = \"asof\"\n\n[dependencies]\nglue = \"*\"\n\n\
+                    [resolution]\nexclude-newer = \"2024-01-01\"\n";
+        let m: Manifest = toml.parse().expect("parse");
+        assert_eq!(m.exclude_newer(), Some("2024-01-01"));
+        assert_eq!(m.resolution_strategy(), ResolutionStrategy::Highest);
+        assert_eq!(m.to_toml_string().expect("serialize"), toml);
     }
 
     #[test]

@@ -7,6 +7,15 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Resolve CRAN as of a date, to reproduce an old analysis** (#194).
+  `uvr lock --exclude-newer 2024-01-01`, or `[resolution] exclude-newer` in
+  `uvr.toml`, resolves CRAN packages from the Posit Package Manager snapshot
+  for that day. `uvr.lock` records the date as `resolved_as_of`, and
+  `uvr sync` installs the P3M binaries from the same snapshot. Bioconductor,
+  custom repositories, and git dependencies have no dated snapshot: uvr warns
+  once and resolves them from their current state. Without the option,
+  resolution is unchanged.
+
 - **Resolve to the lowest allowed versions, so declared floors get tested**
   (#193). `uvr lock`, `uvr add`, and `uvr update` accept
   `--resolution {highest,lowest,lowest-direct}`, and `uvr.toml` accepts

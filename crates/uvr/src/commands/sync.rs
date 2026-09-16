@@ -755,6 +755,8 @@ async fn install_from_lockfile_with_r(
                             platform,
                             bioc_release,
                             slug.as_deref(),
+                            // A dated lock installs from the same snapshot (#194).
+                            lockfile.r.resolved_as_of.as_deref(),
                         )
                         .await,
                     )
@@ -1684,7 +1686,7 @@ fn lockfiles_equivalent(
     if r_minor(&a.r.version) != r_minor(&b.r.version) {
         return false;
     }
-    if a.r.bioc_version != b.r.bioc_version {
+    if a.r.bioc_version != b.r.bioc_version || a.r.resolved_as_of != b.r.resolved_as_of {
         return false;
     }
     if a.packages.len() != b.packages.len() {
@@ -2378,6 +2380,7 @@ mod tests {
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![LockedPackage {
                 name: "jsonlite".into(),
@@ -2401,6 +2404,7 @@ mod tests {
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![LockedPackage {
                 name: "jsonlite".into(),
@@ -2419,6 +2423,7 @@ mod tests {
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![LockedPackage {
                 name: "jsonlite".into(),
@@ -2442,6 +2447,7 @@ mod tests {
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![LockedPackage {
                 name: "jsonlite".into(),
@@ -2465,6 +2471,7 @@ mod tests {
             r: RVersionPin {
                 version: r_ver.into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![],
         };
@@ -2477,6 +2484,7 @@ mod tests {
             r: RVersionPin {
                 version: r_ver.into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![],
         };
@@ -2485,11 +2493,30 @@ mod tests {
     }
 
     #[test]
+    fn lockfiles_not_equivalent_different_resolved_as_of() {
+        // #194: `sync --frozen` re-resolves at the manifest's exclude-newer
+        // date, so a lock made at another date (or live) is out of date.
+        let make = |as_of: Option<&str>| Lockfile {
+            r: RVersionPin {
+                version: "4.5.1".into(),
+                bioc_version: None,
+                resolved_as_of: as_of.map(str::to_string),
+            },
+            packages: vec![],
+        };
+        let dated = make(Some("2024-01-01"));
+        assert!(lockfiles_equivalent(&dated, &make(Some("2024-01-01"))));
+        assert!(!lockfiles_equivalent(&dated, &make(Some("2024-06-01"))));
+        assert!(!lockfiles_equivalent(&dated, &make(None)));
+    }
+
+    #[test]
     fn lockfiles_not_equivalent_different_requires() {
         let make = |requires: Vec<String>| Lockfile {
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![LockedPackage {
                 name: "ggplot2".into(),
@@ -2911,6 +2938,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![nested_locked("rlang", NESTED_SHA, subdirectory)],
         };
@@ -2975,6 +3003,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![
                 locked_pkg(
@@ -3038,6 +3067,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
                 r: RVersionPin {
                     version: "4.4.2".into(),
                     bioc_version: None,
+                    resolved_as_of: None,
                 },
                 packages: vec![broken],
             })

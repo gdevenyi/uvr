@@ -7,7 +7,7 @@ use uvr_core::manifest::{DependencySpec, ResolutionStrategy};
 use uvr_core::project::Project;
 use uvr_core::r_version::detector::{find_r_binary, query_r_version};
 use uvr_core::registry::bioconductor::BiocRegistry;
-use uvr_core::registry::cran::CranRegistry;
+use uvr_core::registry::cran::{snapshot_date, CranRegistry};
 use uvr_core::registry::forgejo::{
     fetch_commit_sha as fetch_forgejo_commit_sha, parse_forgejo_spec,
     resolve_forgejo_package_with_remote_entries_and_install_dependencies_at_commit_bound,
@@ -26,14 +26,22 @@ use crate::ui;
 
 use super::util::{build_client, make_spinner};
 
-pub async fn run(upgrade: bool, strategy: Option<ResolutionStrategy>) -> Result<()> {
+pub async fn run(
+    upgrade: bool,
+    strategy: Option<ResolutionStrategy>,
+    exclude_newer: Option<String>,
+) -> Result<()> {
     let project = Project::find_cwd().context("Not inside a uvr project")?;
     let start = ui::now();
-    let lockfile = resolve_and_lock_with(&project, upgrade, strategy).await?;
+    let lockfile = lock_and_write(&project, upgrade, strategy, exclude_newer.as_deref()).await?;
+    let as_of = match &lockfile.r.resolved_as_of {
+        Some(date) => format!(", CRAN as of {date}"),
+        None => String::new(),
+    };
     ui::summary(
         format!("Lockfile updated — {} package(s)", lockfile.packages.len()),
         format!(
-            "resolved in {}",
+            "resolved in {}{as_of}",
             ui::palette::format_duration(start.elapsed())
         ),
     );
@@ -53,6 +61,17 @@ pub async fn resolve_and_lock_with(
     upgrade: bool,
     strategy: Option<ResolutionStrategy>,
 ) -> Result<Lockfile> {
+    lock_and_write(project, upgrade, strategy, None).await
+}
+
+/// `resolve_and_lock_with` plus an `--exclude-newer` override; `None` uses
+/// the manifest's `[resolution] exclude-newer`.
+async fn lock_and_write(
+    project: &Project,
+    upgrade: bool,
+    strategy: Option<ResolutionStrategy>,
+    exclude_newer: Option<&str>,
+) -> Result<Lockfile> {
     let client = build_client()?;
     let existing = load_existing_lockfile(project);
     let lockfile = resolve_lockfile(
@@ -62,6 +81,7 @@ pub async fn resolve_and_lock_with(
         existing.as_ref(),
         HashMap::new(),
         strategy,
+        exclude_newer,
     )
     .await?;
     project
@@ -82,6 +102,7 @@ pub async fn resolve_only(project: &Project) -> Result<Lockfile> {
         existing.as_ref(),
         HashMap::new(),
         None,
+        None,
     )
     .await
 }
@@ -101,13 +122,14 @@ pub async fn resolve_only_upgraded(
 ) -> Result<Lockfile> {
     let client = build_client()?;
     // --upgrade: don't reuse locked bioc_version, re-detect fresh
-    resolve_lockfile(project, &client, true, None, pins, strategy).await
+    resolve_lockfile(project, &client, true, None, pins, strategy, None).await
 }
 
 /// Core resolution logic shared by `resolve_and_lock` and `resolve_only`.
 /// `existing` is the current lockfile on disk, used to preserve the locked
 /// Bioconductor version across re-resolves (unless `upgrade` is true).
-/// `strategy` overrides the manifest's `[resolution] strategy`.
+/// `strategy` and `exclude_newer` override the manifest's `[resolution]`
+/// settings.
 async fn resolve_lockfile(
     project: &Project,
     client: &reqwest::Client,
@@ -115,8 +137,21 @@ async fn resolve_lockfile(
     existing: Option<&Lockfile>,
     pins: HashMap<String, PackageInfo>,
     strategy: Option<ResolutionStrategy>,
+    exclude_newer: Option<&str>,
 ) -> Result<Lockfile> {
     let strategy = strategy.unwrap_or_else(|| project.manifest.resolution_strategy());
+    let as_of = exclude_newer
+        .or(project.manifest.exclude_newer())
+        .map(snapshot_date)
+        .transpose()?;
+    if let Some(date) = &as_of {
+        if let Some(live) = live_sources_note(&project.manifest) {
+            tracing::warn!(
+                "exclude-newer {date} applies to CRAN only; {live} have no dated \
+                 snapshot and resolve from their current state"
+            );
+        }
+    }
     // Query the actual running R version to pin in the lockfile.
     let r_constraint = project.manifest.project.r_version.as_deref();
     let r_binary_opt = find_r_binary(r_constraint).ok();
@@ -194,7 +229,12 @@ async fn resolve_lockfile(
     };
 
     // Fetch all indices in parallel: CRAN + Bioc + custom repos + git deps.
-    let cran_fut = CranRegistry::fetch(client, upgrade);
+    let cran_fut = async {
+        match &as_of {
+            Some(date) => CranRegistry::fetch_snapshot(client, date, upgrade).await,
+            None => CranRegistry::fetch(client, upgrade).await,
+        }
+    };
     let bioc_fut = async {
         match &bioc_release {
             Some(rel) => BiocRegistry::fetch_release(client, rel)
@@ -248,7 +288,7 @@ async fn resolve_lockfile(
     // Each pass reports the packages it looked at without them; load those
     // and resolve again until a pass needs nothing new (#193). Highest
     // resolution always finishes in one pass.
-    let lockfile = loop {
+    let mut lockfile = loop {
         let result = {
             let mut chain: Vec<&dyn PackageRegistry> = Vec::new();
             for reg in &custom_registries {
@@ -274,9 +314,32 @@ async fn resolve_lockfile(
             .await
             .context("Failed to load older CRAN releases")?;
     };
+    lockfile.r.resolved_as_of = as_of;
 
     spinner.finish_and_clear();
     Ok(lockfile)
+}
+
+/// Name the manifest's sources that `exclude-newer` cannot cap, because they
+/// have no dated snapshot (#194). `None` when every source is CRAN.
+fn live_sources_note(manifest: &uvr_core::manifest::Manifest) -> Option<String> {
+    let deps = || {
+        manifest
+            .dependencies
+            .values()
+            .chain(manifest.dev_dependencies.values())
+    };
+    let mut live = Vec::new();
+    if deps().any(|s| s.is_bioc()) {
+        live.push("Bioconductor packages".to_string());
+    }
+    for source in &manifest.sources {
+        live.push(format!("packages from repository '{}'", source.name));
+    }
+    if deps().any(|s| matches!(s, DependencySpec::Detailed(d) if d.git.is_some())) {
+        live.push("git dependencies".to_string());
+    }
+    (!live.is_empty()).then(|| live.join(", "))
 }
 
 /// Load the existing lockfile, warning (not erroring) on parse failures.
@@ -1204,6 +1267,32 @@ mod tests {
             &a,
             &package_info("1.0.1", sha, Some("pkgs/a"))
         ));
+    }
+
+    #[test]
+    fn exclude_newer_names_every_source_without_a_snapshot() {
+        // #194: CRAN-only projects get no warning.
+        let mut manifest = uvr_core::manifest::Manifest::new("t", None);
+        manifest.add_dep("glue".into(), DependencySpec::Version("*".into()), false);
+        assert_eq!(live_sources_note(&manifest), None);
+
+        manifest.add_dep(
+            "DESeq2".into(),
+            DependencySpec::Detailed(uvr_core::manifest::DetailedDep {
+                bioc: Some(true),
+                ..Default::default()
+            }),
+            false,
+        );
+        manifest.add_dep("root".into(), git_dep("owner/root", None, None), true);
+        manifest.sources.push(uvr_core::manifest::PackageSource {
+            name: "internal".into(),
+            url: "https://repo.example".into(),
+        });
+        assert_eq!(
+            live_sources_note(&manifest).as_deref(),
+            Some("Bioconductor packages, packages from repository 'internal', git dependencies")
+        );
     }
 
     #[test]

@@ -138,7 +138,7 @@ async fn run() -> Result<()> {
             commands::update::run(args.packages, args.dry_run, args.jobs, args.resolution).await?;
         }
         Commands::Lock(args) => {
-            commands::lock::run(args.upgrade, args.resolution).await?;
+            commands::lock::run(args.upgrade, args.resolution, args.exclude_newer).await?;
         }
         Commands::Tree(args) => {
             commands::tree::run(args.depth)?;

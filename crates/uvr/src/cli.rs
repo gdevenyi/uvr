@@ -313,6 +313,16 @@ pub struct LockArgs {
     /// for this run.
     #[arg(long, value_name = "STRATEGY", value_parser = resolution_parser())]
     pub resolution: Option<ResolutionStrategy>,
+
+    /// Resolve CRAN packages as they stood on DATE (YYYY-MM-DD), from
+    /// Posit Package Manager's CRAN snapshot of that day. Overrides
+    /// `[resolution] exclude-newer` in uvr.toml for this run.
+    #[arg(long, value_name = "DATE", value_parser = parse_exclude_newer)]
+    pub exclude_newer: Option<String>,
+}
+
+fn parse_exclude_newer(s: &str) -> Result<String, String> {
+    uvr_core::registry::cran::snapshot_date(s).map_err(|e| e.to_string())
 }
 
 // ────────────────────────────────────────────────────────────

@@ -258,6 +258,7 @@ or to the repository root.
 | `uvr lock` | Re-resolve all deps and update `uvr.lock` without installing |
 | `uvr lock --upgrade` | Upgrade all packages to their latest allowed versions |
 | `uvr lock --resolution lowest` | Resolve to the oldest versions the constraints allow, to test declared floors (also on `add` and `update`; see [`[resolution]`](#resolution-strategy)) |
+| `uvr lock --exclude-newer 2024-01-01` | Resolve CRAN packages as they were on a date (see [Resolve as of a date](#resolve-as-of-a-date)) |
 | `uvr tree` | Show the dependency tree |
 | `uvr tree --depth 1` | Show only direct dependencies |
 | `uvr run [script.R]` | Run a script (or interactive R) with the project library active |
@@ -504,6 +505,37 @@ builds them from source. uvr does not use a release that needs a package that
 is no longer on CRAN. Bioconductor packages and custom repositories resolve
 from their index without change (a Bioconductor release has one version of
 each package). Git dependencies stay at the commit that they name.
+
+#### Resolve as of a date
+
+```toml
+[resolution]
+exclude-newer = "2024-01-01"   # YYYY-MM-DD
+```
+
+`exclude-newer` resolves CRAN packages as they were on that date, so that you
+can reproduce an analysis as it was then. uvr reads the CRAN index from the
+[Posit Package Manager](https://packagemanager.posit.co) snapshot for that day
+(`https://packagemanager.posit.co/cran/<DATE>`), and records the date in
+`uvr.lock` as `resolved_as_of`. `uvr sync` downloads the source tarballs and
+the P3M binaries from the same snapshot. The first snapshot is 2017-10-10, and
+a date in the future is an error.
+
+- The snapshot shows CRAN as Package Manager copied it on that day. Package
+  Manager can be some days behind CRAN, thus a release that CRAN published a
+  short time before the date can be absent.
+- `--exclude-newer <DATE>` on `uvr lock` overrides the setting for one run.
+  As with `--resolution`, `uvr add`, `uvr sync --frozen`, and later `uvr lock`
+  runs use the `uvr.toml` setting. Thus, to keep a date, write it in
+  `uvr.toml`. `uvr sync --frozen` fails when the date in `uvr.lock` is not
+  the date in `uvr.toml`.
+- With `--resolution lowest`, releases that are older than the snapshot's
+  release download from the CRAN archive, where their MD5 checksum applies.
+- Bioconductor packages, `[[sources]]` repositories, and git dependencies have
+  no dated snapshot. uvr shows one warning that names them, and resolves them
+  from their current state.
+- `UVR_REPOS` has no effect on the date: lock time does not read it, and at
+  sync time a mirror supplies only a binary of the exact locked version.
 
 ---
 

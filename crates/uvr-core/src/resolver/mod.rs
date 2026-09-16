@@ -381,6 +381,7 @@ impl<'a> Resolver<'a> {
             r: crate::lockfile::RVersionPin {
                 version: r_version,
                 bioc_version: bioc_version.map(str::to_string),
+                resolved_as_of: None,
             },
             packages,
         })

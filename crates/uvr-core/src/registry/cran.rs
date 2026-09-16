@@ -15,6 +15,43 @@ use crate::resolver::{is_base_package, normalize_version, parse_version_req, Pac
 const CRAN_PACKAGES_URL: &str = "https://cran.r-project.org/src/contrib/PACKAGES.gz";
 const CRAN_SRC_BASE: &str = "https://cran.r-project.org/src/contrib";
 
+/// Posit Package Manager's CRAN repository. `<PPM_CRAN_URL>/<YYYY-MM-DD>`
+/// serves CRAN as PPM held it on that day (#194).
+const PPM_CRAN_URL: &str = "https://packagemanager.posit.co/cran";
+
+/// Check an `exclude-newer` date and return it as `YYYY-MM-DD`. PPM has a
+/// CRAN snapshot for every day from 2017-10-10 to today (UTC), and answers
+/// 404 outside that range.
+pub fn snapshot_date(date: &str) -> Result<String> {
+    snapshot_date_on(date, chrono::Utc::now().date_naive())
+}
+
+fn snapshot_date_on(date: &str, today: chrono::NaiveDate) -> Result<String> {
+    let parsed = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").map_err(|_| {
+        UvrError::Other(format!(
+            "Invalid exclude-newer date '{date}': expected YYYY-MM-DD"
+        ))
+    })?;
+    let first = chrono::NaiveDate::from_ymd_opt(2017, 10, 10).expect("a valid date");
+    if parsed < first {
+        return Err(UvrError::Other(format!(
+            "exclude-newer date {parsed} is before {first}, the first day \
+             Posit Package Manager has a CRAN snapshot for"
+        )));
+    }
+    if parsed > today {
+        return Err(UvrError::Other(format!(
+            "exclude-newer date {parsed} is in the future (today is {today}, UTC)"
+        )));
+    }
+    Ok(parsed.format("%Y-%m-%d").to_string())
+}
+
+/// The tarball base of PPM's CRAN snapshot for `date`.
+fn snapshot_src_base(date: &str) -> String {
+    format!("{PPM_CRAN_URL}/{date}/src/contrib")
+}
+
 /// A parsed entry from CRAN's PACKAGES.gz.
 #[derive(Debug, Clone)]
 pub struct CranPackageEntry {
@@ -304,6 +341,8 @@ pub struct CranRegistry {
     /// Packages a lowest-version lookup asked for before their history was
     /// loaded. The caller loads them and resolves again.
     history_wanted: Mutex<BTreeSet<String>>,
+    /// The PPM snapshot date this index was read from (#194).
+    snapshot: Option<String>,
 }
 
 impl CranRegistry {
@@ -314,6 +353,7 @@ impl CranRegistry {
             source,
             history_loaded: HashSet::new(),
             history_wanted: Mutex::new(BTreeSet::new()),
+            snapshot: None,
         }
     }
 
@@ -329,6 +369,31 @@ impl CranRegistry {
             None,
         )
         .await
+    }
+
+    /// Fetch the CRAN index as PPM's snapshot of `date` holds it (#194).
+    /// `date` must come from [`snapshot_date`]. Tarballs of the releases the
+    /// snapshot lists download from the same snapshot.
+    pub async fn fetch_snapshot(
+        client: &reqwest::Client,
+        date: &str,
+        force_refresh: bool,
+    ) -> Result<Self> {
+        let src_base = snapshot_src_base(date);
+        // ponytail: PPM sends no ETag or Last-Modified, so each lock downloads
+        // the index again. Skip the request for past dates if that gets slow.
+        let mut registry = Self::fetch_from(
+            client,
+            &format!("cran-{date}"),
+            &format!("{src_base}/PACKAGES.gz"),
+            &src_base,
+            PackageSource::Cran,
+            force_refresh,
+            None,
+        )
+        .await?;
+        registry.snapshot = Some(date.to_string());
+        Ok(registry)
     }
 
     /// Fetch a CRAN-like index from any repository that serves PACKAGES.gz.
@@ -584,9 +649,16 @@ impl CranRegistry {
                 .newest(&entry.name)
                 .is_some_and(|current| current.version != entry.version);
         if archived {
+            // An older release's MD5 (from crandb) is that of CRAN's own
+            // tarball. PPM repackages the tarballs it serves, so under a
+            // snapshot the release still downloads from CRAN's Archive.
+            let base = match self.snapshot {
+                Some(_) => CRAN_SRC_BASE,
+                None => &self.src_base,
+            };
             format!(
-                "{}/Archive/{}/{}_{}.tar.gz",
-                self.src_base, entry.name, entry.name, entry.raw_version
+                "{base}/Archive/{}/{}_{}.tar.gz",
+                entry.name, entry.name, entry.raw_version
             )
         } else {
             format!(
@@ -670,6 +742,9 @@ impl CranRegistry {
     /// Merge the releases of `name` that are older than its current index
     /// entry. Newer ones are skipped: the index is authoritative for what is
     /// current, and a newer crandb release would get a wrong Archive URL.
+    /// For a snapshot index this is also the date cap (#194): CRAN version
+    /// numbers only increase, so nothing older than the snapshot's current
+    /// release was published after it.
     fn merge_history(&mut self, name: &str, entries: Vec<CranPackageEntry>) {
         if let Some(current) = self.index.newest(name).map(|e| e.version.clone()) {
             for entry in entries {
@@ -1506,6 +1581,106 @@ Imports: Biobase
             "https://repo.example/src/contrib/rlang_0.4.0.tar.gz"
         );
         assert!(reg.take_wanted_history().is_empty());
+    }
+
+    // ── exclude-newer (#194) ────────────────────────────────────────
+
+    #[test]
+    fn snapshot_date_accepts_the_ppm_range_and_normalizes() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
+        let ok = |d: &str| snapshot_date_on(d, today).unwrap();
+        assert_eq!(ok("2024-01-01"), "2024-01-01");
+        assert_eq!(ok("2017-10-10"), "2017-10-10", "the first snapshot");
+        assert_eq!(ok("2026-09-16"), "2026-09-16", "today has a snapshot");
+        assert_eq!(ok("2024-1-5"), "2024-01-05");
+        assert_eq!(ok(" 2024-01-01 "), "2024-01-01");
+
+        let err = |d: &str| snapshot_date_on(d, today).unwrap_err().to_string();
+        for bad in [
+            "2024-02-30",
+            "2024/01/01",
+            "01-01-2024",
+            "yesterday",
+            "",
+            "2024-01-01T00:00",
+        ] {
+            assert!(err(bad).contains("expected YYYY-MM-DD"), "{bad}");
+        }
+        assert!(err("2017-10-09").contains("before 2017-10-10"));
+        assert!(err("2026-09-17").contains("in the future"));
+    }
+
+    fn snapshot_registry(packages: &str, date: &str) -> CranRegistry {
+        let mut reg = CranRegistry::new(
+            parse_packages_gz(packages).unwrap(),
+            &snapshot_src_base(date),
+            PackageSource::Cran,
+        );
+        reg.snapshot = Some(date.to_string());
+        reg
+    }
+
+    #[test]
+    fn snapshot_registry_locks_snapshot_urls() {
+        assert_eq!(
+            snapshot_src_base("2024-01-01"),
+            "https://packagemanager.posit.co/cran/2024-01-01/src/contrib"
+        );
+        // A PPM index has no MD5sum field.
+        let reg = snapshot_registry("Package: glue\nVersion: 1.6.2\n\n", "2024-01-10");
+        let info = reg.resolve_package("glue", None).unwrap();
+        assert_eq!(info.source, PackageSource::Cran);
+        assert_eq!(
+            info.url,
+            "https://packagemanager.posit.co/cran/2024-01-10/src/contrib/glue_1.6.2.tar.gz"
+        );
+        assert_eq!(info.checksum, None);
+    }
+
+    #[test]
+    fn snapshot_caps_both_strategies_at_its_current_release() {
+        // PPM's 2024-01-10 snapshot lists glue 1.6.2, although CRAN
+        // published 1.7.0 on 2024-01-09: PPM trails CRAN by a few days.
+        // crandb lists every release; only the older ones are merged.
+        let mut reg = snapshot_registry("Package: glue\nVersion: 1.6.2\n\n", "2024-01-10");
+        assert!(reg.resolve_package_lowest("glue", None).is_ok());
+        assert_eq!(
+            reg.take_wanted_history(),
+            BTreeSet::from(["glue".to_string()]),
+            "a snapshot index still loads history for lowest"
+        );
+        reg.merge_history(
+            "glue",
+            history(
+                "Package: glue\nVersion: 1.6.0\nMD5sum: cran160\n\n\
+                 Package: glue\nVersion: 1.6.1\nMD5sum: cran161\n\n\
+                 Package: glue\nVersion: 1.7.0\nMD5sum: cran170\n\n\
+                 Package: glue\nVersion: 1.8.0\n\n",
+            ),
+        );
+
+        let lowest = |c| reg.resolve_package_lowest("glue", c).unwrap();
+        assert_eq!(lowest(None).version.to_string(), "1.6.0");
+        let info = lowest(Some(">=1.6.1"));
+        assert_eq!(info.version.to_string(), "1.6.1");
+        // An archived release downloads from CRAN, where its MD5 holds.
+        assert_eq!(
+            info.url,
+            "https://cran.r-project.org/src/contrib/Archive/glue/glue_1.6.1.tar.gz"
+        );
+        assert_eq!(info.checksum.as_deref(), Some("md5:cran161"));
+
+        let best = reg.resolve_package("glue", None).unwrap();
+        assert_eq!(best.version.to_string(), "1.6.2");
+        assert!(best.url.contains("/cran/2024-01-10/src/contrib/"));
+
+        // A release after the snapshot is a candidate for neither strategy.
+        for result in [
+            reg.resolve_package_lowest("glue", Some(">=1.7.0")),
+            reg.resolve_package("glue", Some(">=1.7.0")),
+        ] {
+            assert!(matches!(result, Err(UvrError::NoMatchingVersion { .. })));
+        }
     }
 
     #[test]

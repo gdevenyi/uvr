@@ -1764,8 +1764,8 @@ fn test_what_add_script_writes_is_what_run_reads() {
 #[cfg(unix)]
 #[test]
 fn test_add_script_keeps_an_executable_script_executable() {
-    // A rename over the file would reset its mode, and `./script` with a
-    // shebang would stop working.
+    // The file is replaced by a rename from a 0600 temp file. Unless the
+    // mode is carried over, `./script` with a shebang stops working.
     use std::os::unix::fs::PermissionsExt;
     let dir = script_dir("#!/usr/bin/env -S uvr run\nprint(1)\n");
     let path = dir.path().join("script.R");
@@ -1773,6 +1773,24 @@ fn test_add_script_keeps_an_executable_script_executable() {
     uvr_ok(&dir, &["add", "cli", "--script", "script.R"]);
     let mode = fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o755);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_add_script_edits_a_symlinked_script_at_its_target() {
+    // The file is replaced by a rename, which must land on the link's
+    // target: renaming over the link would turn it into a separate file.
+    let dir = script_dir("print(1)\n");
+    let link = dir.path().join("link.R");
+    std::os::unix::fs::symlink("script.R", &link).unwrap();
+    uvr_ok(&dir, &["add", "cli", "--script", "link.R"]);
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let target = fs::read_to_string(dir.path().join("script.R")).unwrap();
+    assert!(target.contains("#   \"cli\","), "{target}");
+    assert!(target.ends_with("# ///\n\nprint(1)\n"), "{target}");
 }
 
 #[test]

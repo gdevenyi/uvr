@@ -21,8 +21,11 @@ pub fn edit_script_header(
     edit: impl FnOnce(&str) -> uvr_core::error::Result<String>,
 ) -> Result<(Vec<String>, Option<String>)> {
     let shown = path.display();
+    // Resolved first, so a symlinked script is edited at its target and the
+    // link stays a link.
+    let target = std::fs::canonicalize(path).with_context(|| format!("Failed to read {shown}"))?;
     let source =
-        std::fs::read_to_string(path).with_context(|| format!("Failed to read {shown}"))?;
+        std::fs::read_to_string(&target).with_context(|| format!("Failed to read {shown}"))?;
     let before = script_header::parse(&source)
         .map_err(|e| anyhow::anyhow!("Invalid script header in {shown}: {e}"))?
         .map(|h| h.dependencies.into_iter().map(|(name, _)| name).collect())
@@ -32,10 +35,25 @@ pub fn edit_script_header(
     if after == source {
         return Ok((before, None));
     }
-    // Written in place rather than renamed over, which would reset the
-    // file's mode (an executable script with a shebang) and break links.
-    std::fs::write(path, &after).with_context(|| format!("Failed to write {shown}"))?;
+    replace_file(&target, &after).with_context(|| format!("Failed to write {shown}"))?;
     Ok((before, Some(after)))
+}
+
+/// Replace the file at `target` with `text` so that a kill or a full disk
+/// part-way leaves the old file whole: the text goes to a temp file beside
+/// it, which gets the original's permissions (an executable script stays
+/// executable) and is then renamed over it. The rename splits a hard link to
+/// the file — a far rarer loss than a truncated script.
+fn replace_file(target: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let permissions = std::fs::metadata(target)?.permissions();
+    let dir = target.parent().unwrap_or(std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(text.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    std::fs::set_permissions(tmp.path(), permissions)?;
+    tmp.persist(target).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Re-export from the ui module so existing call sites keep compiling.

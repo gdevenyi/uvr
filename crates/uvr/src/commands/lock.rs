@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use anyhow::{Context, Result};
 
-use uvr_core::lockfile::Lockfile;
+use uvr_core::lockfile::{Lockfile, PackageSource};
 use uvr_core::manifest::DependencySpec;
 use uvr_core::project::Project;
 use uvr_core::r_version::detector::{find_r_binary, query_r_version};
@@ -19,6 +19,7 @@ use uvr_core::registry::gitlab::{
     fetch_commit_sha as fetch_gitlab_commit_sha, parse_gitlab_spec,
     resolve_gitlab_package_with_remote_entries_and_install_dependencies_at_commit_bound,
 };
+use uvr_core::registry::url::resolve_url_package;
 use uvr_core::registry::{PackageInfo, RegistryChain};
 use uvr_core::resolver::{PackageRegistry, Resolver};
 
@@ -47,6 +48,7 @@ pub async fn resolve_and_lock(project: &Project, upgrade: bool) -> Result<Lockfi
     let existing = load_existing_lockfile(project);
     let lockfile =
         resolve_lockfile(project, &client, upgrade, existing.as_ref(), HashMap::new()).await?;
+    warn_changed_url_tarballs(existing.as_ref(), &lockfile);
     project
         .save_lockfile(&lockfile)
         .context("Failed to write uvr.lock")?;
@@ -192,7 +194,10 @@ async fn resolve_lockfile(
         }
         Ok::<_, anyhow::Error>(regs)
     };
-    let git_fut = resolve_git_deps(client, &project.manifest);
+    let git_fut = async {
+        let url_seeds = resolve_url_deps(client, &project.manifest).await?;
+        resolve_git_deps(client, &project.manifest, url_seeds).await
+    };
 
     let (cran_result, bioc_result, git_result, custom_result) =
         tokio::join!(cran_fut, bioc_fut, git_fut, custom_fut,);
@@ -570,16 +575,92 @@ where
     fetched.map_err(anyhow::Error::msg)
 }
 
+/// A manifest `url` dependency, downloaded: the package, its `Remotes:`, and
+/// its install-time dependency names.
+type UrlSeed = (
+    PackageInfo,
+    Vec<uvr_core::manifest::RemoteEntry>,
+    std::collections::BTreeSet<String>,
+);
+
+/// Download and check each manifest `url` dependency (#189). The tarball's
+/// DESCRIPTION must name the manifest key; otherwise the key would quietly
+/// resolve from a registry instead.
+async fn resolve_url_deps(
+    client: &reqwest::Client,
+    manifest: &uvr_core::manifest::Manifest,
+) -> Result<Vec<UrlSeed>> {
+    let mut seeds = Vec::new();
+    for (name, spec) in manifest
+        .dependencies
+        .iter()
+        .chain(manifest.dev_dependencies.iter())
+    {
+        let Some(url) = spec.url() else {
+            continue;
+        };
+        let seed = resolve_url_package(client, url).await?;
+        check_url_package_name(name, url, &seed.0.name)?;
+        seeds.push(seed);
+    }
+    Ok(seeds)
+}
+
+fn check_url_package_name(key: &str, url: &str, actual: &str) -> Result<()> {
+    if key != actual {
+        anyhow::bail!(
+            "manifest url dependency '{key}' is package '{actual}' ({url}); rename the \
+             uvr.toml entry to '{actual}'; refusing registry fallback"
+        );
+    }
+    Ok(())
+}
+
+/// Re-locking accepts a URL tarball whose bytes changed, which `uvr sync`
+/// refuses as a checksum mismatch. Say so, so the change is never silent.
+/// Only for resolutions that are written to disk.
+fn warn_changed_url_tarballs(existing: Option<&Lockfile>, fresh: &Lockfile) {
+    let Some(existing) = existing else {
+        return;
+    };
+    for pkg in fresh
+        .packages
+        .iter()
+        .filter(|p| p.source == PackageSource::Url)
+    {
+        let Some(old) = existing.get_package(&pkg.name) else {
+            continue;
+        };
+        if old.url == pkg.url && old.checksum != pkg.checksum {
+            tracing::warn!(
+                "The file at {} changed since uvr.lock was written ({} -> {}); uvr.lock now \
+                 records the new checksum.",
+                pkg.url.as_deref().unwrap_or_default(),
+                old.checksum.as_deref().unwrap_or("no checksum"),
+                pkg.checksum.as_deref().unwrap_or("no checksum"),
+            );
+        }
+    }
+}
+
 /// Resolve source-chained git dependencies. Bound requests are required and
 /// enforce DESCRIPTION identity; unbound root hints may fall back to registries.
 /// Commit identity is memoized separately from bound resolution identity.
 async fn resolve_git_deps(
     client: &reqwest::Client,
     manifest: &uvr_core::manifest::Manifest,
+    url_seeds: Vec<UrlSeed>,
 ) -> Result<HashMap<String, PackageInfo>> {
     let mut queue = collect_git_requests(manifest)?;
     let mut pre_resolved: HashMap<String, PackageInfo> = HashMap::new();
     let mut resolved_from: HashMap<String, String> = HashMap::new();
+    // A manifest URL tarball is a manifest source like a git one, so its
+    // `Remotes:` join the walk (#244 source-chain rule).
+    for (info, remotes, parent_dependencies) in url_seeds {
+        enqueue_remote_entries(&mut queue, remotes, &parent_dependencies)?;
+        resolved_from.insert(info.name.clone(), info.url.clone());
+        pre_resolved.insert(info.name.clone(), info);
+    }
     let mut outcomes: HashMap<RequestIdentity, std::result::Result<String, String>> =
         HashMap::new();
     let mut commit_memo: HashMap<CommitIdentity, std::result::Result<String, String>> =
@@ -1173,6 +1254,103 @@ mod tests {
             &a,
             &package_info("1.0.1", sha, Some("pkgs/a"))
         ));
+    }
+
+    fn url_seed(remotes: Vec<RemoteEntry>) -> UrlSeed {
+        let info = PackageInfo {
+            name: "tpkg".to_string(),
+            version: semver::Version::new(1, 2, 0),
+            source: PackageSource::Url,
+            checksum: Some(format!("sha256:{}", "ab".repeat(32))),
+            requires: Vec::new(),
+            url: "https://example.org/tpkg_1.2.0.tar.gz".to_string(),
+            raw_version: Some("1.2.0".to_string()),
+            system_requirements: None,
+            subdirectory: None,
+        };
+        (info, remotes, Default::default())
+    }
+
+    fn url_manifest() -> uvr_core::manifest::Manifest {
+        let mut manifest = uvr_core::manifest::Manifest::new("t", None);
+        manifest.add_dep(
+            "tpkg".into(),
+            DependencySpec::Detailed(uvr_core::manifest::DetailedDep {
+                url: Some("https://example.org/tpkg_1.2.0.tar.gz".into()),
+                ..Default::default()
+            }),
+            false,
+        );
+        manifest
+    }
+
+    struct NoRegistry;
+
+    impl uvr_core::resolver::PackageRegistry for NoRegistry {
+        fn resolve_package(
+            &self,
+            name: &str,
+            _constraint: Option<&str>,
+        ) -> uvr_core::error::Result<PackageInfo> {
+            Err(uvr_core::error::UvrError::PackageNotFound(name.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn url_dependency_is_locked_with_its_url_and_checksum() {
+        let manifest = url_manifest();
+        let pre_resolved = resolve_git_deps(
+            &reqwest::Client::new(),
+            &manifest,
+            vec![url_seed(Vec::new())],
+        )
+        .await
+        .unwrap();
+        let lockfile = Resolver::new(&NoRegistry)
+            .resolve(&manifest, Some("4.4.2"), None, pre_resolved)
+            .unwrap();
+
+        let text = lockfile.to_toml_string().unwrap();
+        assert!(text.contains(r#"source = "url""#), "{text}");
+        assert!(
+            text.contains(r#"url = "https://example.org/tpkg_1.2.0.tar.gz""#),
+            "{text}"
+        );
+        assert!(text.contains(r#"checksum = "sha256:abab"#), "{text}");
+        let reparsed: Lockfile = text.parse().unwrap();
+        assert_eq!(reparsed, lockfile);
+    }
+
+    #[tokio::test]
+    async fn url_dependency_remotes_join_the_walk() {
+        // A bound Remotes entry the walk cannot follow fails closed, which
+        // proves the URL package's DESCRIPTION reached the walk at all.
+        let error = resolve_git_deps(
+            &reqwest::Client::new(),
+            &url_manifest(),
+            vec![url_seed(vec![RemoteEntry::Unsupported {
+                entry: "Alias=url::https://example.org/other.tar.gz".into(),
+                reason: "unsupported provider".into(),
+                bound: true,
+            }])],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("refusing registry fallback"), "{error}");
+    }
+
+    #[test]
+    fn url_package_must_match_its_manifest_key() {
+        check_url_package_name("tpkg", "https://example.org/t.tar.gz", "tpkg").unwrap();
+        let error = check_url_package_name("tpkg", "https://example.org/t.tar.gz", "other")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("'tpkg'") && error.contains("'other'"),
+            "{error}"
+        );
+        assert!(error.contains("refusing registry fallback"), "{error}");
     }
 
     #[test]

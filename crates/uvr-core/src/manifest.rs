@@ -92,6 +92,13 @@ impl DependencySpec {
             _ => None,
         }
     }
+
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            DependencySpec::Detailed(d) => d.url.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 impl Default for DependencySpec {
@@ -125,6 +132,10 @@ pub struct DetailedDep {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subdirectory: Option<String>,
+
+    /// Direct source tarball URL (#189), pinned by sha256 in the lockfile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -147,7 +158,7 @@ impl std::str::FromStr for Manifest {
 
         // Validate [dependencies] and [dev-dependencies]: every value must be
         // a string (bare version) or a table whose keys are known DetailedDep
-        // fields {version, bioc, git, exact, rev, subdirectory}. A TOML table-header entry like
+        // fields {version, bioc, git, exact, rev, subdirectory, url}. A TOML table-header entry like
         // `[dependencies.data.table]` creates a nested table under key `data`
         // with a sub-key `table` — not a valid DetailedDep field. This check
         // catches that case before serde silently resolves the wrong package.
@@ -155,7 +166,15 @@ impl std::str::FromStr for Manifest {
         // NOTE: `VALID_DEP_KEYS` must list every field of `DetailedDep`. A
         // field added to that struct without updating this slice will cause
         // valid manifests to be rejected — keep them in sync.
-        const VALID_DEP_KEYS: &[&str] = &["version", "bioc", "git", "exact", "rev", "subdirectory"];
+        const VALID_DEP_KEYS: &[&str] = &[
+            "version",
+            "bioc",
+            "git",
+            "exact",
+            "rev",
+            "subdirectory",
+            "url",
+        ];
 
         for section in &["dependencies", "dev-dependencies"] {
             if let Some(toml::Value::Table(deps)) = raw.get(*section) {
@@ -427,6 +446,21 @@ impl Manifest {
 }
 
 fn validate_detailed_dependency(name: &str, section: &str, dep: &DetailedDep) -> Result<()> {
+    if let Some(url) = dep.url.as_deref() {
+        if dep.git.is_some() || dep.rev.is_some() || dep.bioc.unwrap_or(false) {
+            return Err(UvrError::ManifestParse(format!(
+                "dependency `{name}` in [{section}]: `url` cannot be combined with `git`, \
+                 `rev`, or `bioc`."
+            )));
+        }
+        if !crate::registry::url::is_source_tarball_url(url) {
+            return Err(UvrError::ManifestParse(format!(
+                "dependency `{name}` in [{section}]: `url` must be an http(s) URL of a source \
+                 tarball ending in .tar.gz or .tgz, got `{url}`."
+            )));
+        }
+    }
+
     if dep.exact {
         let git = dep
             .git
@@ -1996,5 +2030,57 @@ rev = "main"
             m.dependencies.get("myPkg").unwrap().git(),
             Some("user/repo")
         );
+    }
+
+    #[test]
+    fn url_dependency_round_trips_and_old_manifests_are_unchanged() {
+        let toml = r#"[project]
+name = "t"
+
+[dependencies]
+tpkg = { url = "https://example.org/tpkg_1.2.0.tar.gz" }
+"#;
+        let m: Manifest = toml.parse().expect("url dependency must parse");
+        let tpkg = m.dependencies.get("tpkg").unwrap();
+        assert_eq!(tpkg.url(), Some("https://example.org/tpkg_1.2.0.tar.gz"));
+        assert_eq!(tpkg.git(), None);
+        let reparsed: Manifest = m.to_toml_string().unwrap().parse().unwrap();
+        assert_eq!(m, reparsed);
+        assert!(m
+            .to_toml_string()
+            .unwrap()
+            .contains(r#"url = "https://example.org/tpkg_1.2.0.tar.gz""#));
+
+        // A manifest without the new field serializes exactly as before.
+        let old: Manifest = SAMPLE.parse().unwrap();
+        assert!(!old.to_toml_string().unwrap().contains("url"));
+    }
+
+    #[test]
+    fn url_dependency_rejects_other_sources_and_non_tarball_urls() {
+        for (spec, needle) in [
+            (
+                r#"{ url = "https://example.org/t_1.0.tar.gz", git = "u/r" }"#,
+                "cannot be combined",
+            ),
+            (
+                r#"{ url = "https://example.org/t_1.0.tar.gz", rev = "main" }"#,
+                "cannot be combined",
+            ),
+            (
+                r#"{ url = "https://example.org/t_1.0.tar.gz", bioc = true }"#,
+                "cannot be combined",
+            ),
+            (r#"{ url = "https://example.org/t.zip" }"#, "source tarball"),
+            (
+                r#"{ url = "ftp://example.org/t_1.0.tar.gz" }"#,
+                "source tarball",
+            ),
+            (r#"{ url = "../t_1.0.tar.gz" }"#, "source tarball"),
+        ] {
+            let toml = format!("[project]\nname = \"t\"\n\n[dependencies]\nt = {spec}\n");
+            let err = toml.parse::<Manifest>().unwrap_err().to_string();
+            assert!(err.contains(needle), "{spec}: {err}");
+        }
     }
 }

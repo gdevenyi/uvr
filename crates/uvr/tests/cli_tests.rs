@@ -766,10 +766,16 @@ impl Drop for StubGuard {
 }
 
 #[cfg(not(target_os = "windows"))]
-/// Spin up a tiny HTTP server in a thread that serves files from
-/// `tests/fixtures/rpkgs-stub/`. Returns the bound URL (`http://127.0.0.1:PORT`)
-/// and a [`StubGuard`]; the server runs until the guard is dropped.
+/// [`spawn_stub`] over `tests/fixtures/rpkgs-stub/`.
 fn spawn_rpkgs_stub() -> (String, StubGuard) {
+    spawn_stub(fixture("rpkgs-stub"))
+}
+
+#[cfg(not(target_os = "windows"))]
+/// Spin up a tiny HTTP server in a thread that serves files from
+/// `fixtures_root`. Returns the bound URL (`http://127.0.0.1:PORT`)
+/// and a [`StubGuard`]; the server runs until the guard is dropped.
+fn spawn_stub(fixtures_root: std::path::PathBuf) -> (String, StubGuard) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -778,13 +784,6 @@ fn spawn_rpkgs_stub() -> (String, StubGuard) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr");
     let url = format!("http://{}", addr);
-
-    let fixtures_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("tests")
-        .join("fixtures")
-        .join("rpkgs-stub");
 
     listener.set_nonblocking(true).expect("set_nonblocking");
 
@@ -895,6 +894,210 @@ fn lock_with_binary_capable_source_records_source_urls() {
         lock.contains(&format!("{}/src/contrib/jsonlite", server_url)),
         "lockfile should record the source URL from rpkgs-stub: {lock}"
     );
+}
+
+// ─── url dependencies (#189) ───────────────────────────────
+
+/// A gzip tar with `files` (path, contents).
+#[cfg(not(target_os = "windows"))]
+fn gzip_tar(files: &[(&str, &str)]) -> Vec<u8> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut enc);
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            // R's internal untar rejects the default NUL type flag.
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append(&header, contents.as_bytes()).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    enc.finish().unwrap()
+}
+
+/// A minimal installable pure-R source package called `urlpkg`.
+#[cfg(not(target_os = "windows"))]
+fn urlpkg_tarball(version: &str) -> Vec<u8> {
+    let description = format!(
+        "Package: urlpkg\nVersion: {version}\nTitle: Test\nDescription: Test package.\n\
+         License: MIT\nAuthor: uvr\nMaintainer: uvr <uvr@example.org>\nNeedsCompilation: no\n"
+    );
+    gzip_tar(&[
+        ("urlpkg/DESCRIPTION", &description),
+        ("urlpkg/NAMESPACE", "export(hello)\n"),
+        (
+            "urlpkg/R/hello.R",
+            "hello <- function() \"hello from urlpkg\"\n",
+        ),
+    ])
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+#[test]
+fn test_add_no_lock_records_url_dependency() {
+    let dir = init_project("url-no-lock");
+    let url = "https://example.org/dl/urlpkg_0.1.0.tar.gz";
+    uvr_cmd()
+        .args(["add", "--no-lock", url])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
+    let m: uvr_core::manifest::Manifest = content.parse().unwrap();
+    assert_eq!(m.dependencies.get("urlpkg").unwrap().url(), Some(url));
+    assert!(!dir.path().join("uvr.lock").exists());
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn test_add_rejects_urls_that_are_not_source_tarballs() {
+    let root = TempDir::new().unwrap();
+    fs::write(
+        root.path().join("page.tar.gz"),
+        "<!DOCTYPE html><html><body>Not found</body></html>",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("urlpkg_0.1.0.tgz"),
+        gzip_tar(&[(
+            "urlpkg/DESCRIPTION",
+            "Package: urlpkg\nVersion: 0.1.0\nBuilt: R 4.5.0; x86_64-pc-linux-gnu; 2025-01-15; unix\n",
+        )]),
+    )
+    .unwrap();
+    let (base, _server) = spawn_stub(root.path().to_path_buf());
+
+    let dir = init_project("url-reject");
+    let before = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
+    for (file, reason) in [
+        ("page.tar.gz", "not gzip-compressed"),
+        ("urlpkg_0.1.0.tgz", "pre-built binary"),
+        ("missing_0.1.0.tar.gz", "404"),
+    ] {
+        uvr_cmd()
+            .args(["add", "--no-install", &format!("{base}/{file}")])
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(reason));
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("uvr.toml")).unwrap(),
+        before,
+        "a rejected URL must not reach uvr.toml"
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn test_add_url_locks_url_and_checksum() {
+    // Resolution also fetches the CRAN index, like
+    // `lock_with_binary_capable_source_records_source_urls` above.
+    let root = TempDir::new().unwrap();
+    let bytes = urlpkg_tarball("0.1.0");
+    // The file name is not the package name: DESCRIPTION decides.
+    fs::write(root.path().join("build-artifact.tar.gz"), &bytes).unwrap();
+    let (base, _server) = spawn_stub(root.path().to_path_buf());
+    let url = format!("{base}/build-artifact.tar.gz");
+
+    let dir = init_project("url-lock");
+    uvr_cmd()
+        .args(["add", "--no-install", &url])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let manifest: uvr_core::manifest::Manifest = fs::read_to_string(dir.path().join("uvr.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        manifest.dependencies.get("urlpkg").unwrap().url(),
+        Some(url.as_str())
+    );
+    let lock: uvr_core::lockfile::Lockfile = fs::read_to_string(dir.path().join("uvr.lock"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let pkg = lock.get_package("urlpkg").expect("urlpkg locked");
+    assert_eq!(pkg.source, uvr_core::lockfile::PackageSource::Url);
+    assert_eq!(pkg.url.as_deref(), Some(url.as_str()));
+    assert_eq!(pkg.checksum, Some(sha256(&bytes)));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn test_sync_url_dependency_verifies_checksum_then_installs() {
+    if !have_r() {
+        eprintln!("skipping: no R on PATH");
+        return;
+    }
+    let root = TempDir::new().unwrap();
+    let bytes = urlpkg_tarball("0.1.0");
+    fs::write(root.path().join("urlpkg_0.1.0.tar.gz"), &bytes).unwrap();
+    let (base, _server) = spawn_stub(root.path().to_path_buf());
+    let url = format!("{base}/urlpkg_0.1.0.tar.gz");
+
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("uvr.toml"),
+        format!(
+            "[project]\nname = \"urlsync\"\n\n[dependencies]\nurlpkg = {{ url = \"{url}\" }}\n"
+        ),
+    )
+    .unwrap();
+    // `version = "*"` keeps sync from re-resolving for the active R.
+    let write_lock = |checksum: &str| {
+        fs::write(
+            dir.path().join("uvr.lock"),
+            format!(
+                "[r]\nversion = \"*\"\n\n[[package]]\nname = \"urlpkg\"\nversion = \"0.1.0\"\n\
+                 source = \"url\"\nurl = \"{url}\"\nchecksum = \"{checksum}\"\n"
+            ),
+        )
+        .unwrap();
+    };
+    let sync = || {
+        let mut cmd = uvr_cmd();
+        cmd.arg("sync")
+            .current_dir(dir.path())
+            .env("HOME", home.path())
+            .env("UVR_CACHE_DIR", home.path().join("cache"))
+            .env("UVR_PACKAGES_DIR", home.path().join("packages"))
+            .env("UVR_NO_BINARY", "1")
+            .env_remove("UVR_REPOS")
+            .env_remove("UVR_LIBRARY")
+            .env_remove("R_HOME");
+        cmd
+    };
+
+    // The file no longer matches the lockfile: a hard error, nothing installed.
+    let stale = format!("sha256:{}", "0".repeat(64));
+    write_lock(&stale);
+    sync()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(&url))
+        .stderr(predicate::str::contains(&stale))
+        .stderr(predicate::str::contains(sha256(&bytes)))
+        .stderr(predicate::str::contains("run `uvr lock`"));
+    let installed = dir.path().join(".uvr/library/urlpkg/DESCRIPTION");
+    assert!(!installed.exists());
+
+    write_lock(&sha256(&bytes));
+    sync().assert().success();
+    assert!(installed.exists(), "urlpkg was not installed");
 }
 
 #[test]

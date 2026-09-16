@@ -521,6 +521,31 @@ mod tests {
         assert!(!sidecar.exists());
     }
 
+    // #189: served bytes that differ from the lockfile's sha256 (a URL
+    // dependency whose file changed) are a hard error, and nothing is cached.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn sha256_mismatch_on_download_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::registry::url::serve_for_test("200 OK", b"changed bytes".to_vec());
+        let url = format!("{base}/pkg_1.0.0.tar.gz");
+        let pinned = checksum::sha256_hex(b"original bytes");
+
+        let err = run_download_one(tmp.path(), &url, Some(&pinned))
+            .await
+            .unwrap_err();
+        match err {
+            crate::error::UvrError::ChecksumMismatch {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, pinned);
+                assert_eq!(actual, checksum::sha256_hex(b"changed bytes"));
+            }
+            other => panic!("expected ChecksumMismatch, got {other}"),
+        }
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
     // #140: same backfill applies to git: entries — the branch that used to
     // say "accept it this time" must not accept it every time.
     #[tokio::test]

@@ -128,6 +128,8 @@ fn export_renv(lockfile: &Lockfile) -> Result<String> {
         // gitlab's "owner" is a full (possibly nested) namespace path
         // rather than a single segment — same field, different shape.
         let git_host_info = forgejo_info.as_ref().or(gitlab_info.as_ref());
+        // renv restores `RemoteType: url` records via `remotes::install_url`.
+        let url_source = pkg.source == PackageSource::Url;
 
         let remote_sha = if pkg.subdirectory.is_some() {
             pkg.checksum
@@ -159,8 +161,11 @@ fn export_renv(lockfile: &Lockfile) -> Result<String> {
             remote_sha,
             remote_subdir: pkg.subdirectory.clone(),
             remote_url: git_host_info
-                .map(|(host, owner, repo, _)| format!("https://{host}/{owner}/{repo}")),
-            remote_type: git_host_info.map(|_| "git2r".to_string()),
+                .map(|(host, owner, repo, _)| format!("https://{host}/{owner}/{repo}"))
+                .or_else(|| pkg.url.clone().filter(|_| url_source)),
+            remote_type: git_host_info
+                .map(|_| "git2r".to_string())
+                .or_else(|| url_source.then(|| "url".to_string())),
         };
         packages.insert(pkg.name.clone(), entry);
     }
@@ -211,6 +216,7 @@ fn export_source_and_repository(src: &PackageSource) -> (String, Option<String>)
         PackageSource::GitHub => ("GitHub".to_string(), None),
         PackageSource::Forgejo { .. } => ("Git".to_string(), None),
         PackageSource::Gitlab { .. } => ("Git".to_string(), None),
+        PackageSource::Url => ("URL".to_string(), None),
         PackageSource::Local => ("Local".to_string(), None),
         PackageSource::Custom { name } => ("Repository".to_string(), Some(name.clone())),
     }
@@ -642,6 +648,35 @@ mod tests {
         assert_eq!(entry["RemoteSubdir"], "pkgs/nested");
         assert_eq!(entry["RemoteSha"], COMMIT);
         assert_eq!(entry["RemoteRef"], COMMIT);
+    }
+
+    #[test]
+    fn export_renv_url_package() {
+        // #189: renv's own shape for a `remotes::install_url` package.
+        let url = "https://example.org/tpkg_1.2-0.tar.gz";
+        let lockfile = single_package_lockfile(LockedPackage {
+            name: "tpkg".to_string(),
+            version: "1.2.0".to_string(),
+            raw_version: Some("1.2-0".to_string()),
+            source: PackageSource::Url,
+            checksum: Some(format!("sha256:{}", "ab".repeat(32))),
+            requires: vec![],
+            url: Some(url.to_string()),
+            system_requirements: None,
+            dev: false,
+            subdirectory: None,
+        });
+
+        let json = export_renv(&lockfile).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entry = &parsed["Packages"]["tpkg"];
+        assert_eq!(entry["Source"], "URL");
+        assert_eq!(entry["Version"], "1.2-0");
+        assert_eq!(entry["RemoteType"], "url");
+        assert_eq!(entry["RemoteUrl"], url);
+        let entry = entry.as_object().unwrap();
+        assert!(!entry.contains_key("Repository"));
+        assert!(!entry.contains_key("RemoteUsername"));
     }
 
     #[test]

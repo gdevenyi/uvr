@@ -7,6 +7,15 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Depend on a source tarball by URL** (#189). `uvr add
+  https://…/pkg_1.2.0.tar.gz` records `pkg = { url = "…" }` in `uvr.toml`;
+  the lockfile pins the URL and a `sha256` checksum (`source = "url"`), and
+  `uvr sync` installs that exact file from source, never a same-named binary.
+  If the file changes, sync fails with both checksums and asks you to run
+  `uvr lock`. A URL that is not an R source package (a web page, a built
+  binary, a tarball without one top-level package directory) is rejected
+  when you add or lock it. `uvr export` writes these as renv `URL` remotes.
+
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption
   that CRAN's framework build links `libomp` itself. It does not: `libR.dylib`

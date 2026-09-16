@@ -5,6 +5,7 @@ pub mod github;
 pub mod gitlab;
 pub mod p3m;
 pub mod p3m_status;
+pub mod url;
 
 use semver::Version;
 

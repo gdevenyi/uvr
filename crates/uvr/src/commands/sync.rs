@@ -82,8 +82,10 @@ fn select_pkg_plan<'a>(
 ) -> PkgPlan<'a> {
     let source_url_str = source_url(p, bioc_release);
 
-    // A nested package only exists inside its repository archive; a same-name binary is a different package.
-    if p.subdirectory.is_some() {
+    // A nested package only exists inside its repository archive, and a URL
+    // package is exactly its pinned tarball (#189); a same-name binary is a
+    // different package.
+    if p.subdirectory.is_some() || p.source == uvr_core::lockfile::PackageSource::Url {
         return PkgPlan {
             pkg: p,
             url: source_url_str,
@@ -857,6 +859,7 @@ async fn install_from_lockfile_with_r(
         let results = downloader
             .download_all(&specs)
             .await
+            .map_err(|e| explain_url_checksum_mismatch(e, &plans))
             .context("Download failed")?;
 
         // Phase: pre-sniff every downloaded tarball so the upfront message and
@@ -1676,7 +1679,7 @@ fn installed_version(name: &str, library: &std::path::Path) -> Option<String> {
 /// Compare two lockfiles for semantic equivalence, ignoring fields that can
 /// legitimately differ between lockfile versions (e.g. `url`, `checksum`).
 /// Compares: R major.minor version + set of (name, version, source,
-/// subdirectory, requires) tuples.
+/// subdirectory, requires) tuples, plus the `url` of a URL package.
 fn lockfiles_equivalent(
     a: &uvr_core::lockfile::Lockfile,
     b: &uvr_core::lockfile::Lockfile,
@@ -1703,6 +1706,9 @@ fn lockfiles_equivalent(
             && ap.version == bp.version
             && ap.source == bp.source
             && ap.subdirectory == bp.subdirectory
+            // A URL package is identified by its URL (#189); its checksum is
+            // checked at download.
+            && (ap.source != uvr_core::lockfile::PackageSource::Url || ap.url == bp.url)
             && a_reqs == b_reqs
     })
 }
@@ -2179,6 +2185,33 @@ fn write_library_r_sentinel(library: &std::path::Path, minor: &str) {
     let _ = std::fs::write(library_sentinel_path(library), format!("{minor}\n"));
 }
 
+/// A URL dependency whose file no longer matches uvr.lock (#189): name the
+/// URL and say how to accept the change. Other errors pass through.
+fn explain_url_checksum_mismatch(
+    e: uvr_core::error::UvrError,
+    plans: &[PkgPlan<'_>],
+) -> anyhow::Error {
+    if let uvr_core::error::UvrError::ChecksumMismatch {
+        package,
+        expected,
+        actual,
+    } = &e
+    {
+        let url_plan = plans.iter().find(|p| {
+            p.pkg.name == *package && p.pkg.source == uvr_core::lockfile::PackageSource::Url
+        });
+        if let Some(plan) = url_plan {
+            return anyhow::anyhow!(
+                "Checksum mismatch for {package}: the file at {url} is {actual}, but uvr.lock \
+                 records {expected}. The file changed since it was locked; run `uvr lock` if \
+                 the change is expected.",
+                url = plan.url
+            );
+        }
+    }
+    e.into()
+}
+
 /// Return the source download URL for a locked package.
 /// Prefers the stored `url` field; falls back to reconstructing it.
 /// Uses `raw_version` (e.g. `"1.1-3"`) when available so the reconstructed
@@ -2201,7 +2234,7 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
                 pkg.name, ver
             )
         }
-        // Forgejo, GitLab, GitHub, and Local always have `url` populated by
+        // Forgejo, GitLab, GitHub, URL, and Local always have `url` populated by
         // the resolver (or are file:// paths handled elsewhere); the
         // `if let Some(url) ...` guard at the top of this function takes
         // the URL straight from `pkg.url`. If we reach this arm with no
@@ -2210,6 +2243,7 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
         PackageSource::Forgejo { .. }
         | PackageSource::Gitlab { .. }
         | PackageSource::GitHub
+        | PackageSource::Url
         | PackageSource::Local => String::new(),
         PackageSource::Custom { .. } => {
             // Custom repo packages should always have a stored URL from resolution.
@@ -2905,6 +2939,71 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(plan.fallback_url.is_none());
     }
 
+    fn url_locked() -> LockedPackage {
+        LockedPackage {
+            source: PackageSource::Url,
+            checksum: Some(format!("sha256:{}", "ab".repeat(32))),
+            ..locked_pkg("rlang", "1.1.6", "https://example.org/rlang_1.1.6.tar.gz")
+        }
+    }
+
+    #[test]
+    fn select_plan_forces_source_for_a_url_package() {
+        // #189: the custom repo (and P3M) have a same-name, same-version
+        // binary; the URL package must still install from its own tarball.
+        let pkg = url_locked();
+        let reg = CranRegistry::for_test(
+            parse_packages_gz(rlang_musl_packages()).unwrap(),
+            "https://rpkgs.example.com/src/contrib".into(),
+        );
+        let plan = select_pkg_plan(&pkg, &[&reg], None, &musl_host(), "4.5", None);
+        assert!(!plan.is_binary);
+        assert_eq!(plan.url, "https://example.org/rlang_1.1.6.tar.gz");
+        assert!(plan.fallback_url.is_none());
+    }
+
+    #[test]
+    fn url_checksum_mismatch_names_the_url_and_the_fix() {
+        let pkg = url_locked();
+        let plans = [PkgPlan {
+            pkg: &pkg,
+            url: pkg.url.clone().unwrap(),
+            fallback_url: None,
+            is_binary: false,
+        }];
+        let mismatch = |package: &str| uvr_core::error::UvrError::ChecksumMismatch {
+            package: package.into(),
+            expected: "sha256:old".into(),
+            actual: "sha256:new".into(),
+        };
+
+        let msg = explain_url_checksum_mismatch(mismatch("rlang"), &plans).to_string();
+        for needle in [
+            "https://example.org/rlang_1.1.6.tar.gz",
+            "sha256:old",
+            "sha256:new",
+            "run `uvr lock` if the change is expected",
+        ] {
+            assert!(msg.contains(needle), "missing {needle}: {msg}");
+        }
+
+        // A registry package keeps the plain error.
+        let cran = locked_pkg(
+            "cli",
+            "3.6.0",
+            "https://cran.r-project.org/cli_3.6.0.tar.gz",
+        );
+        let cran_plans = [PkgPlan {
+            pkg: &cran,
+            url: cran.url.clone().unwrap(),
+            fallback_url: None,
+            is_binary: false,
+        }];
+        let msg = explain_url_checksum_mismatch(mismatch("cli"), &cran_plans).to_string();
+        assert!(!msg.contains("uvr lock"), "{msg}");
+        assert!(msg.contains("Checksum mismatch for cli"), "{msg}");
+    }
+
     #[test]
     fn lockfiles_not_equivalent_different_subdirectory() {
         let make = |subdirectory: Option<&str>| Lockfile {
@@ -2925,6 +3024,32 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(!lockfiles_equivalent(
             &make(Some("pkgs/rlang")),
             &make(None)
+        ));
+    }
+
+    #[test]
+    fn lockfiles_not_equivalent_different_package_url() {
+        // `--frozen` must notice a manifest that now names another tarball.
+        let make = |url: &str, checksum: &str| Lockfile {
+            r: RVersionPin {
+                version: "4.4.2".into(),
+                bioc_version: None,
+            },
+            packages: vec![LockedPackage {
+                url: Some(url.into()),
+                checksum: Some(checksum.into()),
+                ..url_locked()
+            }],
+        };
+        let a = "https://example.org/a/rlang_1.1.6.tar.gz";
+        let b = "https://example.org/b/rlang_1.1.6.tar.gz";
+        assert!(lockfiles_equivalent(
+            &make(a, "sha256:aa"),
+            &make(a, "sha256:bb")
+        ));
+        assert!(!lockfiles_equivalent(
+            &make(a, "sha256:aa"),
+            &make(b, "sha256:aa")
         ));
     }
 

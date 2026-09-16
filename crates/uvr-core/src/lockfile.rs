@@ -79,6 +79,9 @@ pub enum PackageSource {
     Gitlab {
         host: String,
     },
+    /// A source tarball pinned by URL (#189). The tarball is in
+    /// `LockedPackage.url`, its `sha256:` in `checksum`. Serializes as `"url"`.
+    Url,
     Local,
     /// A custom CRAN-like repository (r-multiverse, r-universe, PPM, etc.)
     Custom {
@@ -105,6 +108,7 @@ impl<'de> Deserialize<'de> for PackageSource {
             "bioconductor" => PackageSource::Bioconductor,
             "github" => PackageSource::GitHub,
             "local" => PackageSource::Local,
+            "url" => PackageSource::Url,
             _ => {
                 // `forgejo:<host>` with a non-empty host → Forgejo variant.
                 // Anything else (including a bare `forgejo:`) falls through
@@ -140,6 +144,7 @@ impl std::fmt::Display for PackageSource {
             PackageSource::GitHub => write!(f, "github"),
             PackageSource::Forgejo { host } => write!(f, "forgejo:{host}"),
             PackageSource::Gitlab { host } => write!(f, "gitlab:{host}"),
+            PackageSource::Url => write!(f, "url"),
             PackageSource::Local => write!(f, "local"),
             PackageSource::Custom { name } => write!(f, "{name}"),
         }
@@ -449,6 +454,36 @@ subdirectory = "pkgs/nested"
         let lf: Lockfile = SAMPLE.parse().expect("parse");
         assert!(lf.get_package("ggplot2").unwrap().subdirectory.is_none());
         assert!(!lf.to_toml_string().unwrap().contains("subdirectory"));
+    }
+
+    #[test]
+    fn round_trip_url_source() {
+        // #189: a URL dependency keeps its tarball URL and sha256 across a
+        // round-trip, and the existing SAMPLE (no url source) is unchanged.
+        let input = r#"[r]
+version = "4.4.2"
+
+[[package]]
+name = "tpkg"
+version = "1.2.0"
+source = "url"
+raw_version = "1.2.0"
+url = "https://example.org/tpkg_1.2.0.tar.gz"
+checksum = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#;
+        let lf: Lockfile = input.parse().expect("parse url source");
+        let pkg = lf.get_package("tpkg").unwrap();
+        assert_eq!(pkg.source, PackageSource::Url);
+        assert_eq!(
+            pkg.url.as_deref(),
+            Some("https://example.org/tpkg_1.2.0.tar.gz")
+        );
+        assert_eq!(lf.to_toml_string().unwrap(), input);
+
+        let old: Lockfile = SAMPLE.parse().unwrap();
+        let reparsed: Lockfile = old.to_toml_string().unwrap().parse().unwrap();
+        assert_eq!(old, reparsed);
+        assert!(!old.to_toml_string().unwrap().contains("\"url\""));
     }
 
     #[test]

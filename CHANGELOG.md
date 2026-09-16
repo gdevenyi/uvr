@@ -7,6 +7,15 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Credentials from `~/.netrc`** (#186). If no `UVR_REPO_*` variable is set
+  for a `[[sources]]` repository, uvr uses the `~/.netrc` entry for its host
+  (HTTP basic auth). GitHub, GitLab and Forgejo dependencies also use the
+  entry's password as their access token when their token variables are
+  not set. An environment credential always has precedence. `NETRC` gives a
+  different file. On Unix, uvr shows a warning and ignores a netrc file
+  that other users can access. uvr never uses a `default` entry. The
+  `401`/`403` message now also names the netrc entry to add.
+
 - **Install from authenticated repositories** (#185). A `[[sources]]`
   repository (a private Posit Package Manager, an internal mirror) can now
   require credentials. uvr reads them from the environment, keyed by the

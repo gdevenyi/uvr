@@ -574,19 +574,7 @@ async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Resul
             // #95: attach a GitHub token when available so CI runners
             // walking renv.lock imports don't hit the 60 req/hr shared
             // unauthenticated rate limit.
-            let auth = {
-                let mut found: Option<String> = None;
-                for var in ["GITHUB_PAT", "GITHUB_TOKEN"] {
-                    if let Ok(v) = std::env::var(var) {
-                        let t = v.trim().to_string();
-                        if !t.is_empty() {
-                            found = Some(format!("Bearer {t}"));
-                            break;
-                        }
-                    }
-                }
-                found
-            };
+            let auth = uvr_core::registry::github::github_token().map(|t| format!("Bearer {t}"));
             (url, auth)
         };
 

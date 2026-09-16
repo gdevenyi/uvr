@@ -409,8 +409,9 @@ pub async fn fetch_commit_sha(
 /// (Actions / generic CI convention). Without a token GitHub's
 /// unauthenticated rate limit is 60 req/hr shared by everyone behind
 /// the same egress IP — easy to exhaust on a CI runner walking an
-/// `renv.lock` with several github deps (#95).
-fn github_token() -> Option<String> {
+/// `renv.lock` with several github deps (#95). Without either variable,
+/// the password of the `~/.netrc` entry for `github.com` (#186).
+pub fn github_token() -> Option<String> {
     for var in ["GITHUB_PAT", "GITHUB_TOKEN"] {
         if let Ok(v) = std::env::var(var) {
             let t = v.trim();
@@ -419,7 +420,7 @@ fn github_token() -> Option<String> {
             }
         }
     }
-    None
+    crate::auth::netrc_password("github.com")
 }
 
 /// Parse install-time dependencies from DESCRIPTION, keeping every distinct constraint.

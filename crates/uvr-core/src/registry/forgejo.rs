@@ -104,6 +104,7 @@ pub fn parse_forgejo_spec(spec: &str) -> Option<(String, String, String, String)
 /// Lookup order:
 /// 1. `UVR_FORGEJO_TOKEN_<NORMALIZED_HOST>` — per-host.
 /// 2. `UVR_FORGEJO_TOKEN` — single token for users with one instance.
+/// 3. The password of the host's `~/.netrc` entry (#186).
 ///
 /// Host normalization: strip `:port`, uppercase, replace `.` and `-`
 /// with `_`. E.g. `codefloe.com` → `CODEFLOE_COM`, `git.local:3000` →
@@ -126,7 +127,7 @@ pub fn forgejo_token(host: &str) -> Option<String> {
             }
         }
     }
-    None
+    crate::auth::netrc_password(host_no_port)
 }
 
 /// Resolve a Forgejo-hosted R package while deliberately discarding rich
@@ -382,7 +383,8 @@ fn map_forgejo_error(
     match status.as_u16() {
         401 | 403 => UvrError::Other(format!(
             "Forgejo returned {status} for {host}/{owner}/{repo}; \
-             set UVR_FORGEJO_TOKEN_<HOST> if the repo is private."
+             set UVR_FORGEJO_TOKEN_<HOST> (or add a ~/.netrc entry for the host) \
+             if the repo is private."
         )),
         404 => UvrError::Other(format!(
             "Forgejo repository not found: {host}/{owner}/{repo}@{ref_or_sha}. \

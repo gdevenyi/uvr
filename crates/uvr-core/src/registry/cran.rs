@@ -1209,7 +1209,8 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
 
     // #185: the repository's env credential reaches the index request, a
     // refusal is actionable (also when a cached index exists), and a public
-    // repository gets no `Authorization` header at all.
+    // repository gets no `Authorization` header at all. #186: with no env
+    // credential, the netrc entry for the host is used instead.
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn fetch_custom_authenticates_the_index_request() {
@@ -1218,17 +1219,21 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
 
         let _env = crate::env_vars::env_lock();
         let cache = tempfile::tempdir().unwrap();
-        let vars = ["UVR_CACHE_DIR", "UVR_REPO_TOKEN_AUTHREPO"];
+        let vars = ["UVR_CACHE_DIR", "UVR_REPO_TOKEN_AUTHREPO", "NETRC"];
         let saved: Vec<_> = vars.iter().map(std::env::var_os).collect();
         std::env::set_var("UVR_CACHE_DIR", cache.path());
         std::env::set_var("UVR_REPO_TOKEN_AUTHREPO", "tok123");
+        // No netrc file yet: the user's own ~/.netrc must not interfere.
+        std::env::set_var("NETRC", cache.path().join("no-netrc"));
 
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(b"Package: privpkg\nVersion: 1.0\n").unwrap();
         let gz = gz.finish().unwrap();
         let index = gz.clone();
-        let (private, _) = test_server(move |head| {
-            if test_authorization(head) == Some("Bearer tok123") {
+        let (private, private_seen) = test_server(move |head| {
+            // base64("alice:n3trc-pw")
+            let auth = test_authorization(head);
+            if auth == Some("Bearer tok123") || auth == Some("Basic YWxpY2U6bjN0cmMtcHc=") {
                 test_response("200 OK", "ETag: \"v1\"\r\n", &index)
             } else {
                 test_response("401 Unauthorized", "", b"")
@@ -1265,8 +1270,44 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(reg.resolve_package("privpkg", None).is_ok());
         let seen = public_seen.lock().unwrap();
         assert_eq!(test_authorization(&seen[0]), None, "{seen:?}");
-
         drop(seen);
+
+        // #186: no env credential, but a netrc entry for the host.
+        let write_netrc = |name: &str, password: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            // A new file name each time: netrc is cached per path.
+            let path = cache.path().join(name);
+            std::fs::write(
+                &path,
+                format!("machine 127.0.0.1 login alice password {password}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::env::set_var("NETRC", &path);
+        };
+        write_netrc("netrc-good", "n3trc-pw");
+        let reg = fetch("authrepo", private.clone(), true).expect("netrc accepted");
+        assert!(reg.resolve_package("privpkg", None).is_ok());
+        let last = private_seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            test_authorization(&last),
+            Some("Basic YWxpY2U6bjN0cmMtcHc=")
+        );
+
+        write_netrc("netrc-bad", "wrong-pw");
+        let err = fetch("authrepo", private.clone(), true)
+            .err()
+            .expect("a wrong netrc password must fail")
+            .to_string();
+        assert!(err.contains("`machine 127.0.0.1` entry in"), "{err}");
+        assert!(!err.contains("wrong-pw"), "{err}");
+
+        // An env token takes precedence over netrc.
+        std::env::set_var("UVR_REPO_TOKEN_AUTHREPO", "tok123");
+        fetch("authrepo", private, true).expect("token accepted");
+        let last = private_seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(test_authorization(&last), Some("Bearer tok123"));
+
         for (var, value) in vars.iter().zip(saved) {
             match value {
                 Some(v) => std::env::set_var(var, v),

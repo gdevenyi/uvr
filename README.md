@@ -492,7 +492,20 @@ export UVR_REPO_PASSWORD_INTERNAL_PPM=...
 - `<NAME>` is the source `name` with any `:port` suffix removed, in upper case, and with each character that is not a letter or digit changed to `_` (`internal-ppm` → `INTERNAL_PPM`). For `uvr add --source <url>` and `UVR_REPOS`, the name is the URL host (`ppm.corp.example:8443` → `PPM_CORP_EXAMPLE`).
 - If the token is set, uvr uses it and ignores the user and password. uvr removes spaces at the start and end of each value. An empty value counts as not set.
 - uvr sends the credential with the index (`PACKAGES.gz`) request and with each package download, but only to URLs under the source `url`. When a redirect goes to a different host or port, uvr does not send it. uvr never shows it in output (`-v` included), and does not pass it to `R CMD INSTALL`.
-- A `401` or `403` response gives an error that names the repository and the variables to set.
+- If none of these variables is set, uvr uses the `~/.netrc` entry for the repository host, with HTTP basic auth:
+
+  ```
+  machine ppm.corp.example
+    login alice
+    password ...
+  ```
+
+  - uvr reads the file in `NETRC` if it is set. On Windows, uvr reads `%USERPROFILE%\_netrc` when there is no `.netrc`.
+  - `machine` is the host name only. It never includes a port, so an entry applies to all ports on that host.
+  - uvr does not use a `default` entry, because it would send the same credential to every repository and git host.
+  - On Unix, if the file gives any access to users other than you (for example, mode `644` or `640`), uvr shows a warning and does not use the file. The run continues. To fix this, run `chmod 600 ~/.netrc`.
+  - GitHub, GitLab and Forgejo dependencies also use `~/.netrc` when their token variables (`GITHUB_PAT`/`GITHUB_TOKEN`, `UVR_GITLAB_TOKEN[_<HOST>]`, `UVR_FORGEJO_TOKEN[_<HOST>]`) are not set. uvr sends the entry's `password` as the host's access token (GitHub uses `machine github.com`), so the password must be a personal access token, not your account password.
+- A `401` or `403` response gives an error that names the repository and the variables or netrc entry to set.
 - Credentials written into the URL (`https://user:pass@host/...`) still work, and uvr hides them in its output. But they are also saved in `uvr.lock`, so use the variables. `uvr add --source` does not accept such a URL.
 
 ---

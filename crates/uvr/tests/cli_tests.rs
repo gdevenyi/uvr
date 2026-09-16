@@ -980,6 +980,8 @@ fn private_repo_cmd(dir: &TempDir, store: &TempDir, env: &[(&str, &str)]) -> Com
         .env("UVR_CACHE_DIR", store.path().join("cache"))
         .env("UVR_PACKAGES_DIR", store.path().join("packages"))
         .env("UVR_NO_BINARY", "1")
+        // Not the user's ~/.netrc; a test may write this file.
+        .env("NETRC", store.path().join("netrc"))
         .env_remove("UVR_REPOS");
     for (k, v) in env {
         cmd.env(k, v);
@@ -1084,6 +1086,78 @@ fn private_repository_url_credentials_are_redacted() {
         &[],
         "s3cret-185",
     );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn private_repository_with_netrc_resolves_and_installs() {
+    let netrc_dir = TempDir::new().unwrap();
+    let netrc = netrc_dir.path().join("netrc");
+    fs::write(
+        &netrc,
+        "# uvr test\nmachine 127.0.0.1\n  login alice\n  password n3trc-186\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&netrc, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert_private_repo_installs(
+        // base64("alice:n3trc-186")
+        "Basic YWxpY2U6bjN0cmMtMTg2",
+        "",
+        &[("NETRC", netrc.to_str().unwrap())],
+        "n3trc-186",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn private_repository_netrc_permissions_and_precedence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, store, _url, _server) = private_repo_project("Basic YWxpY2U6bjN0cmMtMTg2", "");
+    // `private_repo_cmd` points NETRC here.
+    let netrc = store.path().join("netrc");
+    fs::write(&netrc, "machine 127.0.0.1 login alice password n3trc-186\n").unwrap();
+    let add = |env: &[(&str, &str)]| {
+        let out = private_repo_cmd(&dir, &store, env)
+            .args(["add", "--no-install", "uvrauthpkg"])
+            .output()
+            .unwrap();
+        (out.status.success(), output_text(&out))
+    };
+
+    // Other users can read it: uvr warns, skips it, and carries on
+    // without credentials.
+    fs::set_permissions(&netrc, fs::Permissions::from_mode(0o644)).unwrap();
+    let (ok, text) = add(&[]);
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains("users other than you can access it"),
+        "{text}"
+    );
+    assert!(text.contains("it needs credentials"), "{text}");
+    assert!(
+        text.contains("add a `machine 127.0.0.1` entry to"),
+        "{text}"
+    );
+    assert!(!text.contains("n3trc-186"), "{text}");
+
+    fs::set_permissions(&netrc, fs::Permissions::from_mode(0o600)).unwrap();
+    // An env credential takes precedence over netrc.
+    let (ok, text) = add(&[("UVR_REPO_TOKEN_PRIVATE_REPO", "wrong-186")]);
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains("refused the token in UVR_REPO_TOKEN_PRIVATE_REPO"),
+        "{text}"
+    );
+    // Without it, the netrc entry authenticates.
+    let (ok, text) = add(&[]);
+    assert!(ok, "{text}");
+    assert!(!text.contains("users other than you"), "{text}");
+    assert!(!text.contains("n3trc-186"), "{text}");
 }
 
 #[cfg(not(target_os = "windows"))]

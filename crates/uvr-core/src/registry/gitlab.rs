@@ -121,6 +121,7 @@ pub fn parse_gitlab_spec(spec: &str) -> Option<(String, String, String)> {
 /// Lookup order:
 /// 1. `UVR_GITLAB_TOKEN_<NORMALIZED_HOST>` — per-host.
 /// 2. `UVR_GITLAB_TOKEN` — single token for users with one instance.
+/// 3. The password of the host's `~/.netrc` entry (#186).
 ///
 /// Host normalization: strip `:port`, uppercase, replace `.` and `-`
 /// with `_`. E.g. `gitlab.com` → `GITLAB_COM`, `git.local:3000` →
@@ -143,7 +144,7 @@ pub fn gitlab_token(host: &str) -> Option<String> {
             }
         }
     }
-    None
+    crate::auth::netrc_password(host_no_port)
 }
 
 /// Resolve a GitLab-hosted R package while deliberately discarding rich
@@ -401,7 +402,8 @@ fn map_gitlab_error(
     match status.as_u16() {
         401 | 403 => UvrError::Other(format!(
             "GitLab returned {status} for {host}/{project_path}; \
-             set UVR_GITLAB_TOKEN_<HOST> if the project is private."
+             set UVR_GITLAB_TOKEN_<HOST> (or add a ~/.netrc entry for the host) \
+             if the project is private."
         )),
         404 => UvrError::Other(format!(
             "GitLab project not found: {host}/{project_path}@{ref_or_sha}. \

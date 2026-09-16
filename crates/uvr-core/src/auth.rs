@@ -20,6 +20,11 @@ use crate::lockfile::PackageSource;
 const TOKEN_PREFIX: &str = "UVR_REPO_TOKEN_";
 const USER_PREFIX: &str = "UVR_REPO_USER_";
 const PASSWORD_PREFIX: &str = "UVR_REPO_PASSWORD_";
+const GIT_TOKEN_PREFIX: &str = "UVR_GIT_TOKEN_";
+const GIT_USER_PREFIX: &str = "UVR_GIT_USER_";
+/// The user name sent with a `UVR_GIT_TOKEN_<HOST>` token. Bitbucket Cloud
+/// access tokens need this name, and GitLab ignores the name.
+const DEFAULT_GIT_USER: &str = "x-token-auth";
 
 /// A credential for one repository or git host. `Debug` prints
 /// `Bearer ***` / `Basic ***` / `Token ***`, never the secret.
@@ -63,6 +68,20 @@ impl Credential {
                     Err(_) => req.header(AUTHORIZATION, value),
                 }
             }
+        }
+    }
+
+    /// The `Authorization` header value, for a client that is not reqwest
+    /// (the `git` program, #190).
+    pub fn header_value(&self) -> String {
+        use base64::Engine;
+        match self {
+            Credential::Bearer(token) => format!("Bearer {token}"),
+            Credential::Basic { username, password } => format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+            ),
+            Credential::Token(token) => format!("token {token}"),
         }
     }
 }
@@ -128,6 +147,16 @@ fn env_credential(key: &str) -> Option<Credential> {
     })
 }
 
+/// The `host[:port]` of an `https://` or `http://` URL, as the URL writes
+/// it. `None` for other URLs, and for a URL with `user@` in it.
+pub(crate) fn http_authority(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    (!authority.is_empty() && !authority.contains('@')).then_some(authority)
+}
+
 fn url_host(url: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .ok()?
@@ -191,6 +220,9 @@ pub enum GitHost<'a> {
     GitHub,
     GitLab(&'a str),
     Forgejo(&'a str),
+    /// Any other host, reached with the `git` program (#190). The value is
+    /// the clone URL. Only an `https://` URL gets a credential from uvr.
+    Git(&'a str),
 }
 
 impl<'a> GitHost<'a> {
@@ -200,15 +232,26 @@ impl<'a> GitHost<'a> {
             PackageSource::GitHub => Some(GitHost::GitHub),
             PackageSource::Gitlab { host } => Some(GitHost::GitLab(host)),
             PackageSource::Forgejo { host } => Some(GitHost::Forgejo(host)),
+            PackageSource::Git { url } => Some(GitHost::Git(url)),
             _ => None,
         }
     }
 
-    fn label(&self) -> String {
+    /// `host[:port]`. For a `Git` URL that is not `http(s)://`, the URL.
+    fn host(&self) -> &'a str {
+        match self {
+            GitHost::GitHub => "github.com",
+            GitHost::GitLab(host) | GitHost::Forgejo(host) => host,
+            GitHost::Git(url) => http_authority(url).unwrap_or(url),
+        }
+    }
+
+    pub(crate) fn label(&self) -> String {
         match self {
             GitHost::GitHub => "GitHub".into(),
             GitHost::GitLab(host) => format!("GitLab host {host}"),
             GitHost::Forgejo(host) => format!("Forgejo host {host}"),
+            GitHost::Git(_) => format!("git host {}", self.host()),
         }
     }
 
@@ -217,30 +260,29 @@ impl<'a> GitHost<'a> {
     /// (the CI name). A token also lifts GitHub's anonymous limit of 60
     /// requests per hour (#95). GitLab and Forgejo: the variable for this
     /// host, then the variable for all hosts. `<HOST>` is [`env_key`] of
-    /// the host (`git.local:3000` → `GIT_LOCAL`).
-    fn token_vars(&self) -> [String; 2] {
+    /// the host (`git.local:3000` → `GIT_LOCAL`). Any other git host: only
+    /// its own variable. A variable for all such hosts would send one token
+    /// to every host that a dependency names.
+    fn token_vars(&self) -> Vec<String> {
         match self {
-            GitHost::GitHub => ["GITHUB_PAT".into(), "GITHUB_TOKEN".into()],
-            GitHost::GitLab(host) => [
+            GitHost::GitHub => vec!["GITHUB_PAT".into(), "GITHUB_TOKEN".into()],
+            GitHost::GitLab(host) => vec![
                 format!("UVR_GITLAB_TOKEN_{}", env_key(host)),
                 "UVR_GITLAB_TOKEN".into(),
             ],
-            GitHost::Forgejo(host) => [
+            GitHost::Forgejo(host) => vec![
                 format!("UVR_FORGEJO_TOKEN_{}", env_key(host)),
                 "UVR_FORGEJO_TOKEN".into(),
             ],
+            GitHost::Git(_) => vec![format!("{GIT_TOKEN_PREFIX}{}", env_key(self.host()))],
         }
     }
 
     /// The netrc `machine` of this host: the host name without a port.
     /// GitHub uses `github.com`, the host that its dependencies name.
     fn machine(&self) -> &'a str {
-        match self {
-            GitHost::GitHub => "github.com",
-            GitHost::GitLab(host) | GitHost::Forgejo(host) => {
-                host.split_once(':').map_or(host, |(h, _port)| h)
-            }
-        }
+        let host = self.host();
+        host.split_once(':').map_or(host, |(h, _port)| h)
     }
 
     /// Whether `url` is on this host, so that the host's credential can go
@@ -259,6 +301,7 @@ impl<'a> GitHost<'a> {
                 git_origin("raw.githubusercontent.com"),
             ],
             GitHost::GitLab(host) | GitHost::Forgejo(host) => vec![git_origin(host)],
+            GitHost::Git(url) => http_authority(url).map(git_origin).into_iter().collect(),
         };
         origins
             .iter()
@@ -267,7 +310,7 @@ impl<'a> GitHost<'a> {
     }
 
     /// The first token variable that is set, as (name, value).
-    fn env_token(&self) -> Option<(String, String)> {
+    pub(crate) fn env_token(&self) -> Option<(String, String)> {
         self.token_vars().into_iter().find_map(|var| {
             let token = crate::env_vars::read_env_var(&var)?.trim().to_string();
             Some((var, token))
@@ -283,15 +326,40 @@ impl<'a> GitHost<'a> {
     ///
     /// Forgejo gets `Authorization: token …`. GitHub and GitLab get
     /// `Bearer …`. Values are trimmed, and empty values count as unset.
+    ///
+    /// Any other git host (`Git`) gets HTTP basic auth, which is what git
+    /// servers take, with the token as the password; see `git_credential`.
     pub fn credential(&self) -> Option<Credential> {
+        let scheme: fn(String) -> Credential = match self {
+            GitHost::Git(url) => return self.git_credential(url),
+            GitHost::Forgejo(_) => Credential::Token,
+            GitHost::GitHub | GitHost::GitLab(_) => Credential::Bearer,
+        };
         let token = match self.env_token() {
             Some((_, token)) => token,
             None if self.netrc_refused() => return None,
             None => netrc_password(self.machine())?,
         };
-        Some(match self {
-            GitHost::Forgejo(_) => Credential::Token(token),
-            GitHost::GitHub | GitHost::GitLab(_) => Credential::Bearer(token),
+        Some(scheme(token))
+    }
+
+    /// The credential of a `Git` host with an `http(s)://` URL: the token
+    /// variable with the user name in `UVR_GIT_USER_<HOST>` (default
+    /// `x-token-auth`), else the netrc login and password. The caller sends
+    /// it only to URLs that [`GitHost::serves`], which excludes `http://`.
+    fn git_credential(&self, url: &str) -> Option<Credential> {
+        let host = http_authority(url)?;
+        if let Some((_, password)) = self.env_token() {
+            let username = read_var(GIT_USER_PREFIX, &env_key(host))
+                .unwrap_or_else(|| DEFAULT_GIT_USER.into());
+            return Some(Credential::Basic { username, password });
+        }
+        let entry = netrc_entry(self.machine()).filter(|e| !e.password.is_empty())?;
+        Some(Credential::Basic {
+            username: Some(entry.login)
+                .filter(|login| !login.is_empty())
+                .unwrap_or_else(|| DEFAULT_GIT_USER.into()),
+            password: entry.password,
         })
     }
 
@@ -387,7 +455,8 @@ impl<'a> GitHost<'a> {
     /// What to do about a 401 or 403 from this host. The text never
     /// contains the credential.
     pub fn denied_advice(&self) -> String {
-        let [first, second] = self.token_vars();
+        let vars = self.token_vars();
+        let first = &vars[0];
         let machine = self.machine();
         let netrc = netrc_display();
         if let Some((var, _)) = self.env_token() {
@@ -402,9 +471,19 @@ impl<'a> GitHost<'a> {
                  that it is a valid access token, or set {first}, which has precedence."
             );
         }
+        if let GitHost::Git(_) = self {
+            let user = format!("{GIT_USER_PREFIX}{}", env_key(self.host()));
+            return format!(
+                "if the repository is private, set {first} to an access token (and {user} if \
+                 the host needs a user name other than `{DEFAULT_GIT_USER}`), or add a \
+                 `machine {machine}` entry with your login and the token as its password to \
+                 {netrc}."
+            );
+        }
         format!(
-            "if the repository is private, set {first} (or {second}) to an access token, or \
-             add a `machine {machine}` entry with the token as its password to {netrc}."
+            "if the repository is private, set {first} (or {}) to an access token, or \
+             add a `machine {machine}` entry with the token as its password to {netrc}.",
+            vars[1]
         )
     }
 
@@ -608,12 +687,18 @@ impl NetrcLexer<'_> {
     }
 }
 
-/// Whether env var `name` holds a repository credential.
+/// Whether env var `name` holds a repository or `git::` host credential.
 pub fn is_credential_var(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    [TOKEN_PREFIX, USER_PREFIX, PASSWORD_PREFIX]
-        .iter()
-        .any(|p| upper.starts_with(p))
+    [
+        TOKEN_PREFIX,
+        USER_PREFIX,
+        PASSWORD_PREFIX,
+        GIT_TOKEN_PREFIX,
+        GIT_USER_PREFIX,
+    ]
+    .iter()
+    .any(|p| upper.starts_with(p))
 }
 
 /// A package repository and the credential the environment gives it.
@@ -1372,6 +1457,55 @@ mod tests {
         );
         assert_eq!(GitHost::for_source(&PackageSource::GitHub), Some(github));
         assert_eq!(GitHost::for_source(&PackageSource::Cran), None);
+
+        // #190: a `git::` host is the https origin of its clone URL.
+        let url = "https://git.corp.example/team/repo.git";
+        let git = GitHost::Git(url);
+        assert!(git.serves(url));
+        assert!(git.serves("https://GIT.corp.example:443/other/repo.git"));
+        assert!(!git.serves("http://git.corp.example/team/repo.git"));
+        assert!(!git.serves("https://git.corp.example:8443/team/repo.git"));
+        assert!(!git.serves("https://api.github.com/repos/o/r"));
+        for url in [
+            "http://git.corp.example/team/repo.git",
+            "ssh://git@git.corp.example/team/repo.git",
+            "git@git.corp.example:team/repo.git",
+            "file:///srv/repo.git",
+        ] {
+            assert!(!GitHost::Git(url).serves(url), "{url}");
+        }
+        assert_eq!(
+            GitHost::for_source(&PackageSource::Git { url: url.into() }),
+            Some(git)
+        );
+        assert!(!GitHost::GitLab("git.corp.example").serves("ssh://git.corp.example/x"));
+    }
+
+    #[test]
+    fn git_host_advice_names_its_own_variables() {
+        let _env = GitEnv::new(&["UVR_GIT_TOKEN_GIT_CORP_EXAMPLE"]);
+        let host = GitHost::Git("https://git.corp.example:8443/team/repo.git");
+        assert_eq!(host.label(), "git host git.corp.example:8443");
+        let msg = host.denied_advice();
+        assert!(
+            msg.contains("set UVR_GIT_TOKEN_GIT_CORP_EXAMPLE to an access token")
+                && msg.contains("UVR_GIT_USER_GIT_CORP_EXAMPLE")
+                && msg.contains("`machine git.corp.example` entry"),
+            "{msg}"
+        );
+        assert!(!msg.contains("UVR_GITLAB") && !msg.contains("(or"), "{msg}");
+        std::env::set_var("UVR_GIT_TOKEN_GIT_CORP_EXAMPLE", "s3cret");
+        let msg = host.denied_advice();
+        assert!(
+            msg.contains("refused the token in UVR_GIT_TOKEN_GIT_CORP_EXAMPLE."),
+            "{msg}"
+        );
+        assert!(!msg.contains("s3cret"), "{msg}");
+        assert_eq!(
+            format!("{:?}", host.credential().unwrap()),
+            "Basic ***",
+            "the token is basic auth, and Debug hides it"
+        );
     }
 
     #[test]
@@ -1471,6 +1605,8 @@ mod tests {
         assert!(is_credential_var("UVR_REPO_TOKEN_X"));
         assert!(is_credential_var("UVR_REPO_USER_X"));
         assert!(is_credential_var("uvr_repo_password_x"));
+        assert!(is_credential_var("UVR_GIT_TOKEN_GIT_CORP"));
+        assert!(is_credential_var("UVR_GIT_USER_GIT_CORP"));
         assert!(!is_credential_var("UVR_REPOS"));
         assert!(!is_credential_var("GITHUB_PAT"));
     }

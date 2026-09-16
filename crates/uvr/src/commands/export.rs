@@ -129,7 +129,13 @@ fn export_renv(lockfile: &Lockfile) -> Result<String> {
         // rather than a single segment — same field, different shape.
         let git_host_info = forgejo_info.as_ref().or(gitlab_info.as_ref());
 
-        let remote_sha = if pkg.subdirectory.is_some() {
+        // A `git::` package (#190), as renv itself records a git remote.
+        let git_url = match &pkg.source {
+            PackageSource::Git { url } => Some(url.clone()),
+            _ => None,
+        };
+
+        let remote_sha = if pkg.subdirectory.is_some() || git_url.is_some() {
             pkg.checksum
                 .as_deref()
                 .and_then(|c| c.strip_prefix("git:"))
@@ -158,9 +164,14 @@ fn export_renv(lockfile: &Lockfile) -> Result<String> {
                 .or_else(|| git_host_info.map(|(_, _, _, sha)| sha.clone())),
             remote_sha,
             remote_subdir: pkg.subdirectory.clone(),
-            remote_url: git_host_info
-                .map(|(host, owner, repo, _)| format!("https://{host}/{owner}/{repo}")),
-            remote_type: git_host_info.map(|_| "git2r".to_string()),
+            remote_type: match (&git_url, git_host_info) {
+                (Some(_), _) => Some("git".to_string()),
+                (None, Some(_)) => Some("git2r".to_string()),
+                (None, None) => None,
+            },
+            remote_url: git_url.or_else(|| {
+                git_host_info.map(|(host, owner, repo, _)| format!("https://{host}/{owner}/{repo}"))
+            }),
         };
         packages.insert(pkg.name.clone(), entry);
     }
@@ -211,6 +222,8 @@ fn export_source_and_repository(src: &PackageSource) -> (String, Option<String>)
         PackageSource::GitHub => ("GitHub".to_string(), None),
         PackageSource::Forgejo { .. } => ("Git".to_string(), None),
         PackageSource::Gitlab { .. } => ("Git".to_string(), None),
+        // renv's own spelling for a git remote.
+        PackageSource::Git { .. } => ("git".to_string(), None),
         PackageSource::Local => ("Local".to_string(), None),
         PackageSource::Custom { name } => ("Repository".to_string(), Some(name.clone())),
     }
@@ -810,6 +823,46 @@ mod tests {
         assert_eq!(parsed["Packages"]["mypkg"]["RemoteUsername"], "my-group");
         assert_eq!(parsed["Packages"]["mypkg"]["RemoteRepo"], "mypkg");
         assert_eq!(parsed["Packages"]["mypkg"]["RemoteRef"], "abc123");
+    }
+
+    // #190: renv records a git remote as Source "git", RemoteType "git",
+    // RemoteUrl, and the installed commit in RemoteSha, and restores it by
+    // fetching RemoteSha from RemoteUrl.
+    #[test]
+    fn export_renv_generic_git_package_matches_renv() {
+        use uvr_core::lockfile::{LockedPackage, Lockfile, PackageSource, RVersionPin};
+
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let url = "git@bitbucket.org:team/anypkg.git";
+        let lockfile = Lockfile {
+            r: RVersionPin {
+                version: "4.4.2".to_string(),
+                bioc_version: None,
+            },
+            packages: vec![LockedPackage {
+                name: "anypkg".to_string(),
+                version: "0.1.0".to_string(),
+                raw_version: None,
+                source: PackageSource::Git { url: url.into() },
+                checksum: Some(format!("git:{sha}")),
+                requires: vec!["jsonlite".into()],
+                url: None,
+                system_requirements: None,
+                dev: false,
+                subdirectory: None,
+            }],
+        };
+
+        let json = export_renv(&lockfile).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let pkg = &parsed["Packages"]["anypkg"];
+        assert_eq!(pkg["Source"], "git");
+        assert_eq!(pkg["RemoteType"], "git");
+        assert_eq!(pkg["RemoteUrl"], url);
+        assert_eq!(pkg["RemoteSha"], sha);
+        for absent in ["Repository", "RemoteUsername", "RemoteRepo", "RemoteRef"] {
+            assert!(pkg.get(absent).is_none(), "{absent}: {pkg}");
+        }
     }
 
     #[test]

@@ -1218,6 +1218,256 @@ fn test_add_source_refuses_credentials_in_the_url() {
     );
 }
 
+// ─── any git host (#190) ───────────────────────────────────
+//
+// Gated to non-Windows like the other networked-style CLI tests; the
+// unit tests in git_generic.rs run the same git calls on every platform.
+
+#[cfg(not(target_os = "windows"))]
+fn have_git() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=uvr", "-c", "user.email=uvr@example.com"])
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+        .args(["-c", "core.hooksPath=/dev/null", "-C"])
+        .arg(dir)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+#[cfg(not(target_os = "windows"))]
+/// A git repository holding the pure-R package `uvrgitpkg`: tag `v0.1.0`
+/// at version 0.1.0, then 0.2.0 on `main`. Returns the store, the
+/// `file://` URL, and the tagged commit. The store also holds an isolated
+/// cache with an empty CRAN index, so resolution needs no network.
+fn git_repo_store() -> (TempDir, String, String) {
+    let store = TempDir::new().unwrap();
+    let repo = store.path().join("repo");
+    fs::create_dir_all(repo.join("R")).unwrap();
+    let description = |version: &str| {
+        format!(
+            "Package: uvrgitpkg\nVersion: {version}\nTitle: Test\nDescription: Test package.\n\
+             License: MIT\nAuthor: uvr\nMaintainer: uvr <uvr@example.com>\nNeedsCompilation: no\n"
+        )
+    };
+    fs::write(repo.join("DESCRIPTION"), description("0.1.0")).unwrap();
+    fs::write(repo.join("NAMESPACE"), "export(hello)\n").unwrap();
+    fs::write(repo.join("R/hello.R"), "hello <- function() \"hi\"\n").unwrap();
+    git_in(&repo, &["init", "-q"]);
+    git_in(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git_in(&repo, &["add", "-A"]);
+    git_in(&repo, &["commit", "-q", "-m", "first"]);
+    git_in(&repo, &["tag", "-a", "v0.1.0", "-m", "v0.1.0"]);
+    let tagged = git_in(&repo, &["rev-parse", "HEAD"]);
+    fs::write(repo.join("DESCRIPTION"), description("0.2.0")).unwrap();
+    git_in(&repo, &["commit", "-q", "-am", "second"]);
+
+    let cache = store.path().join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("cran-packages.txt"), "").unwrap();
+    let url = format!("file://{}", repo.display());
+    (store, url, tagged)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn git_project_cmd(dir: &TempDir, store: &TempDir) -> Command {
+    let mut cmd = uvr_cmd();
+    cmd.current_dir(dir.path())
+        .env("UVR_CACHE_DIR", store.path().join("cache"))
+        .env("UVR_PACKAGES_DIR", store.path().join("packages"))
+        .env("UVR_NO_BINARY", "1")
+        .env("NETRC", store.path().join("netrc"))
+        .env_remove("UVR_REPOS");
+    cmd
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn git_dependency_locks_installs_and_resyncs() {
+    if !have_git() {
+        eprintln!("skipping: no git on PATH");
+        return;
+    }
+    let (store, url, tagged) = git_repo_store();
+    let dir = init_project("gitproj");
+    let spec = format!("git::{url}@v0.1.0");
+
+    let out = git_project_cmd(&dir, &store)
+        .args(["add", "--no-install", &spec])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    // The repository is named `repo`; DESCRIPTION names the package.
+    assert!(text.contains("repo → uvrgitpkg"), "{text}");
+    let toml = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
+    let manifest: uvr_core::manifest::Manifest = toml.parse().unwrap();
+    let dep = manifest
+        .dependencies
+        .get("uvrgitpkg")
+        .unwrap_or_else(|| panic!("{toml}"));
+    assert_eq!(dep.git(), Some(format!("git::{url}").as_str()));
+    assert!(toml.contains("rev = \"v0.1.0\""), "{toml}");
+
+    // The lock pins the tagged commit (not the tag object), has no `url`,
+    // and a second lock writes the same file.
+    let lock_path = dir.path().join("uvr.lock");
+    let lock = fs::read_to_string(&lock_path).unwrap();
+    let lockfile: uvr_core::lockfile::Lockfile = lock.parse().unwrap();
+    let pkg = lockfile
+        .get_package("uvrgitpkg")
+        .unwrap_or_else(|| panic!("{lock}"));
+    assert_eq!(pkg.version, "0.1.0");
+    assert_eq!(
+        pkg.source,
+        uvr_core::lockfile::PackageSource::Git { url: url.clone() }
+    );
+    assert_eq!(
+        pkg.checksum.as_deref(),
+        Some(format!("git:{tagged}").as_str())
+    );
+    assert_eq!(pkg.url, None);
+    let out = git_project_cmd(&dir, &store).arg("lock").output().unwrap();
+    assert!(out.status.success(), "{}", output_text(&out));
+    assert_eq!(fs::read_to_string(&lock_path).unwrap(), lock);
+
+    if !have_r() {
+        eprintln!("skipping the install half: no R on PATH");
+        return;
+    }
+    let installed = dir.path().join(".uvr/library/uvrgitpkg/DESCRIPTION");
+    let out = git_project_cmd(&dir, &store)
+        .args(["sync", "-v"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        fs::read_to_string(&installed)
+            .unwrap()
+            .contains("Version: 0.1.0"),
+        "{text}"
+    );
+
+    // Re-sync without the repository: the library, then the package cache,
+    // are gone, and the archive of the locked commit is still in the cache.
+    fs::remove_dir_all(store.path().join("repo")).unwrap();
+    fs::remove_dir_all(dir.path().join(".uvr/library/uvrgitpkg")).unwrap();
+    fs::remove_dir_all(store.path().join("packages")).unwrap();
+    let out = git_project_cmd(&dir, &store).arg("sync").output().unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(installed.exists(), "{text}");
+    let out = git_project_cmd(&dir, &store).arg("sync").output().unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("Everything is up to date"), "{text}");
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn git_dependency_without_git_fails_clearly() {
+    if !have_git() {
+        eprintln!("skipping: no git on PATH to build the fixture");
+        return;
+    }
+    let (store, url, _) = git_repo_store();
+    let dir = init_project("nogitproj");
+    let before = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
+    let empty_path = TempDir::new().unwrap();
+    let out = git_project_cmd(&dir, &store)
+        .env("PATH", empty_path.path())
+        .args(["add", "--no-install", &format!("git::{url}")])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("`git` is not on PATH"), "{text}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("uvr.toml")).unwrap(),
+        before
+    );
+
+    // `uvr doctor` says so too, and calls it an issue for this project.
+    let out = git_project_cmd(&dir, &store)
+        .env("PATH", empty_path.path())
+        .args(["add", "--no-lock", &format!("git::{url}")])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", output_text(&out));
+    let out = git_project_cmd(&dir, &store)
+        .env("PATH", empty_path.path())
+        .arg("doctor")
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("needed for git:: dependencies"), "{text}");
+    assert!(
+        text.contains("git is not on PATH, and this project has git:: dependencies"),
+        "{text}"
+    );
+}
+
+#[test]
+fn test_doctor_reports_git() {
+    let out = uvr_cmd().arg("doctor").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    let git_found = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let row = stdout
+        .lines()
+        .find(|line| line.contains(" git "))
+        .unwrap_or_else(|| panic!("no git row: {stdout}"));
+    assert_eq!(
+        row.contains("found") && !row.contains("not found"),
+        git_found,
+        "{row}"
+    );
+}
+
+// The existing spec shapes are written as before (#190 regression).
+#[test]
+fn test_add_no_lock_keeps_every_git_spec_shape() {
+    let dir = init_project("specshapes");
+    uvr_cmd()
+        .args([
+            "add",
+            "--no-lock",
+            "owner/ghpkg@v1",
+            "forgejo::codefloe.com/team/fjpkg@main",
+            "gitlab::gitlab.com/group/sub/glpkg",
+            "git::git@bitbucket.org:team/bbpkg.git@v2",
+        ])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let toml = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
+    for expected in [
+        "[dependencies.ghpkg]\ngit = \"owner/ghpkg\"\nrev = \"v1\"\n",
+        "[dependencies.fjpkg]\ngit = \"forgejo::codefloe.com/team/fjpkg\"\nrev = \"main\"\n",
+        "[dependencies.glpkg]\ngit = \"gitlab::gitlab.com/group/sub/glpkg\"\n",
+        "[dependencies.bbpkg]\ngit = \"git::git@bitbucket.org:team/bbpkg.git\"\nrev = \"v2\"\n",
+    ] {
+        assert!(toml.contains(expected), "{expected}\n---\n{toml}");
+    }
+}
+
 #[test]
 fn test_init_writes_activation_shims() {
     let dir = init_project("shimproj");

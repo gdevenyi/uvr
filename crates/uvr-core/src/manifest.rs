@@ -109,7 +109,8 @@ pub struct DetailedDep {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bioc: Option<bool>,
 
-    /// `"user/repo"` — GitHub source
+    /// `"user/repo"` (GitHub), `"forgejo::…"`, `"gitlab::…"`, or
+    /// `"git::<clone URL>"` (any git host, #190)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<String>,
 
@@ -442,7 +443,9 @@ fn validate_detailed_dependency(name: &str, section: &str, dep: &DetailedDep) ->
             Some(rev) => format!("{git}@{rev}"),
             None => git.to_string(),
         };
-        let valid = if git.starts_with("forgejo::") {
+        let valid = if git.starts_with("git::") {
+            crate::registry::git_generic::manifest_spec(git, dep.rev.as_deref()).is_ok()
+        } else if git.starts_with("forgejo::") {
             crate::registry::forgejo::parse_forgejo_parts(&spec).is_some()
         } else if git.starts_with("gitlab::") {
             crate::registry::gitlab::parse_gitlab_parts(&spec).is_some()
@@ -465,7 +468,10 @@ fn validate_detailed_dependency(name: &str, section: &str, dep: &DetailedDep) ->
             "dependency `{name}` in [{section}]: `subdirectory` requires a `git` source."
         ))
     })?;
-    if git.starts_with("forgejo::") || git.starts_with("gitlab::") {
+    if ["forgejo::", "gitlab::", "git::"]
+        .iter()
+        .any(|prefix| git.starts_with(prefix))
+    {
         return Err(UvrError::ManifestParse(format!(
             "dependency `{name}` in [{section}]: `subdirectory` is only supported for \
              GitHub sources (`git = \"owner/repo\"`), not `{git}`."
@@ -1880,6 +1886,9 @@ nested = { git = "owner/repo", subdirectory = "pkgs/nested" }
             "git = \"owner/repo\"\nrev = \"\"\nexact = true\n",
             "git = \"owner/repo/extra\"\nexact = true\n",
             "git = \"gitlab::host/group/repo/-/subdir\"\nexact = true\n",
+            "git = \"git::https://tok@host/repo.git\"\nexact = true\n",
+            "git = \"git::https://host/repo.git@v1\"\nrev = \"v2\"\nexact = true\n",
+            "git = \"git::git@host:repo.git\"\nrev = \"-x\"\nexact = true\n",
         ];
         for dependency in cases {
             let toml = format!("[project]\nname = \"t\"\n\n[dependencies.repo]\n{dependency}");
@@ -1887,6 +1896,28 @@ nested = { git = "owner/repo", subdirectory = "pkgs/nested" }
             assert!(error.contains("exact = true"), "{error}");
             assert!(error.contains("requires a"), "{error}");
         }
+    }
+
+    // #190: a `git::` dependency parses and is written back unchanged. Its
+    // `rev` is kept apart from the URL, which may hold `@` and `:`.
+    #[test]
+    fn generic_git_dependency_round_trips() {
+        let toml = "[project]\nname = \"t\"\n\n\
+                    [dependencies.anypkg]\ngit = \"git::https://git.corp.example/team/repo.git\"\n\
+                    rev = \"abc123\"\n\n\
+                    [dependencies.sshpkg]\ngit = \"git::git@host:repo.git\"\nexact = true\n\
+                    rev = \"v1\"\n";
+        let m: Manifest = toml.parse().unwrap();
+        assert_eq!(
+            m.dependencies.get("anypkg").unwrap().git(),
+            Some("git::https://git.corp.example/team/repo.git")
+        );
+        let written = m.to_toml_string().unwrap();
+        assert!(
+            written.contains(toml.split_once("\n\n").unwrap().1),
+            "{written}"
+        );
+        assert_eq!(written.parse::<Manifest>().unwrap(), m);
     }
 
     #[test]
@@ -1902,7 +1933,11 @@ subdirectory = "pkgs/nested"
         let err = no_git.parse::<Manifest>().unwrap_err().to_string();
         assert!(err.contains("requires a `git` source"), "got: {err}");
 
-        for host in ["gitlab::gitlab.com/g/p", "forgejo::codefloe.com/o/r"] {
+        for host in [
+            "gitlab::gitlab.com/g/p",
+            "forgejo::codefloe.com/o/r",
+            "git::https://git.corp.example/team/repo.git",
+        ] {
             let toml = format!(
                 "[project]\nname = \"t\"\n\n[dependencies.nested]\ngit = \"{host}\"\n\
                  subdirectory = \"pkgs/nested\"\n"

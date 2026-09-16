@@ -83,7 +83,9 @@ fn select_pkg_plan<'a>(
     let source_url_str = source_url(p, bioc_release);
 
     // A nested package only exists inside its repository archive; a same-name binary is a different package.
-    if p.subdirectory.is_some() {
+    // The same holds for a `git::` package (#190): its commit is the package.
+    if p.subdirectory.is_some() || matches!(p.source, uvr_core::lockfile::PackageSource::Git { .. })
+    {
         return PkgPlan {
             pkg: p,
             url: source_url_str,
@@ -2180,7 +2182,7 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
     }
     let ver = pkg.raw_version.as_deref().unwrap_or(&pkg.version);
     use uvr_core::lockfile::PackageSource;
-    match pkg.source {
+    match &pkg.source {
         PackageSource::Cran => format!(
             "https://cran.r-project.org/src/contrib/{}_{}.tar.gz",
             pkg.name, ver
@@ -2202,6 +2204,9 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
         | PackageSource::Gitlab { .. }
         | PackageSource::GitHub
         | PackageSource::Local => String::new(),
+        // A `git::` package locks no `url`: the downloader fetches the
+        // locked commit from the clone URL (#190).
+        PackageSource::Git { url } => url.clone(),
         PackageSource::Custom { .. } => {
             // Custom repo packages should always have a stored URL from resolution.
             // Fall back to empty if somehow missing.
@@ -2894,6 +2899,32 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(!plan.is_binary);
         assert_eq!(Some(plan.url.as_str()), pkg.url.as_deref());
         assert!(plan.fallback_url.is_none());
+    }
+
+    // #190: a `git::` package installs from its commit, even when a
+    // binary repository has a package of the same name and version.
+    #[test]
+    fn select_plan_forces_source_for_a_git_package() {
+        let url = "https://git.corp.example/team/rlang.git";
+        let pkg = LockedPackage {
+            source: PackageSource::Git { url: url.into() },
+            url: None,
+            ..nested_locked("rlang", NESTED_SHA, None)
+        };
+        let reg = CranRegistry::for_test(
+            parse_packages_gz(rlang_musl_packages()).unwrap(),
+            "https://rpkgs.example.com/src/contrib".into(),
+        );
+        // The same package from GitHub gets the binary.
+        let github = nested_locked("rlang", NESTED_SHA, None);
+        let plan = select_pkg_plan(&github, &[&reg], None, &musl_host(), "4.5", None);
+        assert!(plan.is_binary);
+
+        let plan = select_pkg_plan(&pkg, &[&reg], None, &musl_host(), "4.5", None);
+        assert!(!plan.is_binary);
+        assert_eq!(plan.url, url);
+        assert!(plan.fallback_url.is_none());
+        assert_eq!(source_url(&pkg, None), url);
     }
 
     #[test]

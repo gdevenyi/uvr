@@ -221,6 +221,7 @@ uvr add DESeq2 --bioc
 uvr add tidymodels@>=1.0.0
 uvr add user/repo@main
 uvr add 'user/monorepo@main#subdirectory=packages/nestedPkg'
+uvr add git::https://git.example.com/team/anyPkg.git@v1.0   # any git host
 
 # Install everything from the lockfile
 uvr sync
@@ -465,12 +466,28 @@ dplyr = "*"
 DESeq2 = { bioc = true }
 myPkg = { git = "user/repo", rev = "main" }
 nestedPkg = { git = "user/monorepo", rev = "main", subdirectory = "packages/nestedPkg" }
+anyPkg = { git = "git::https://git.example.com/team/anyPkg.git", rev = "v1.0" }
 
 [dev-dependencies]
 testthat = "*"
 ```
 
 Generated or imported git entries may also carry `exact = true`, which preserves an explicit DESCRIPTION `PackageName=` alias and requires the fetched DESCRIPTION `Package:` field to match the manifest dependency name.
+
+### Packages from any git host
+
+`git::` names a package by the clone URL of its repository, so it works for any git host: Bitbucket, a self-hosted GitLab or Gitea, or a company git server. uvr runs the `git` program for these packages. `uvr doctor` shows whether git is installed.
+
+```sh
+uvr add git::https://git.example.com/team/anyPkg.git@v1.0   # a tag, a branch, or a full commit SHA
+uvr add git::git@bitbucket.org:team/anyPkg.git              # ssh; no ref = the default branch
+```
+
+- uvr accepts `https://`, `ssh://` and `user@host:path` URLs. It also accepts `http://` and `file://` URLs, with a warning: `http` has no transport security, and a `file` path works only on your machine. A URL must not contain credentials (see **Private git repositories** below).
+- `uvr lock` records the commit (`checksum = "git:<sha>"`). `uvr sync` installs that commit from source, and never a binary package of the same name. The commit stays in the download cache, so uvr fetches it only once.
+- To pin a commit, give its full SHA. The host lists branches and tags, so uvr cannot find an abbreviated SHA.
+- The host must let git fetch a commit by its SHA (git protocol v2). GitHub, GitLab, Bitbucket and Codeberg do.
+- Not supported yet: a package in a subdirectory (`#subdirectory=`), and `git::` entries in the `Remotes:` field of a package.
 
 ### Private repositories
 
@@ -508,18 +525,21 @@ export UVR_REPO_PASSWORD_INTERNAL_PPM=...
 - A `401` or `403` response gives an error that names the repository and the variables or netrc entry to set.
 - Credentials written into the URL (`https://user:pass@host/...`) still work, and uvr hides them in its output. But they are also saved in `uvr.lock`, so use the variables. `uvr add --source` does not accept such a URL.
 
-**Private git repositories.** For GitHub, GitLab and Forgejo dependencies, uvr uses the first of these variables that is set as the access token:
+**Private git repositories.** For git dependencies, uvr uses the first of these variables that is set as the access token:
 
 | Host | Variables, in order |
 |---|---|
 | GitHub | `GITHUB_PAT`, `GITHUB_TOKEN` |
 | GitLab | `UVR_GITLAB_TOKEN_<HOST>`, `UVR_GITLAB_TOKEN` |
 | Forgejo | `UVR_FORGEJO_TOKEN_<HOST>`, `UVR_FORGEJO_TOKEN` |
+| Any other host (`git::`) | `UVR_GIT_TOKEN_<HOST>` |
 
 - `<HOST>` is the host, changed as `<NAME>` is above (`git.local:3000` → `GIT_LOCAL`).
 - If none of these variables is set, uvr uses the `password` of the `~/.netrc` entry for the host (for GitHub, `machine github.com`). The password must be an access token, not your account password.
 - uvr sends the token with the API requests, the `DESCRIPTION` request and the tarball download (GitHub and GitLab: `Authorization: Bearer`, Forgejo: `Authorization: token`). uvr sends it only to that host: for GitHub, `api.github.com` and `raw.githubusercontent.com`. uvr never sends it to CRAN, P3M, a `[[sources]]` repository, or a different git host.
 - If a host refuses a netrc password (`401`, or `404` from `raw.githubusercontent.com`), uvr shows a warning and does not use that entry again in the same run. uvr then continues without credentials, so public repositories still work. uvr never ignores a token from a variable: if the host refuses it, uvr stops with an error.
+- For a `git::` dependency, git servers take HTTP basic auth, so uvr sends the token as the password. The user name is `UVR_GIT_USER_<HOST>`, or `x-token-auth` if that is not set (Bitbucket Cloud access tokens need that name; GitLab accepts any name). From `~/.netrc`, uvr uses the `login` and `password` of the entry. uvr gives the header to git in `GIT_CONFIG_*` environment variables, which need git 2.31 or later, and never on the command line. git sends it only to the `https://` origin of the URL. There is no variable for all `git::` hosts, because it would send one token to every host that a dependency names.
+- If uvr has no token for a `git::` host, git uses its own credential helpers. For `ssh://` and `user@host:path` URLs, git uses your ssh keys and agent, and uvr sends nothing. uvr turns off the terminal prompts of git, so a private repository without credentials fails instead of waiting for input.
 
 ---
 

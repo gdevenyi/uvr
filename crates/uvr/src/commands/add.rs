@@ -7,6 +7,7 @@ use uvr_core::project::Project;
 use uvr_core::r_version::detector::{find_r_binary, query_r_version};
 use uvr_core::registry::bioconductor::{default_release_for_r, BiocRegistry};
 use uvr_core::registry::forgejo::parse_forgejo_parts;
+use uvr_core::registry::git_generic::parse_git_parts;
 use uvr_core::registry::gitlab::parse_gitlab_parts;
 use uvr_core::resolver::is_base_package;
 
@@ -31,6 +32,35 @@ fn split_subdirectory_fragment(raw: &str) -> Result<(&str, Option<&str>)> {
 
 /// Parse `"pkg@>=1.0.0"`, `"user/repo@ref"`, or `"user/repo@ref#subdirectory=path"` into (name, spec).
 fn parse_add_spec(raw: &str, bioc: bool) -> Result<(String, DependencySpec)> {
+    // Any git host: `git::<clone URL>[@ref]` (#190). The URL can contain `/`,
+    // so this comes before the GitHub heuristic too. The name is the
+    // repository name until the DESCRIPTION lookup replaces it.
+    if raw.starts_with("git::") {
+        if raw.contains("#subdirectory=") {
+            anyhow::bail!(
+                "`#subdirectory=` is not supported for git:: sources yet (in '{}').",
+                uvr_core::auth::redact_url(raw)
+            );
+        }
+        let parsed = parse_git_parts(raw).map_err(|reason| {
+            anyhow::anyhow!(
+                "Invalid git spec '{}': {reason}. Expected: git::<clone URL>[@ref], with an \
+                 https://, ssh:// or user@host:path URL",
+                uvr_core::auth::redact_url(raw)
+            )
+        })?;
+        let name = uvr_core::registry::git_generic::repo_name(&parsed.url).to_string();
+        if !package_name::is_valid(&name) {
+            anyhow::bail!("Invalid package name '{name}' extracted from git spec '{raw}'");
+        }
+        let spec = DependencySpec::Detailed(DetailedDep {
+            git: Some(format!("git::{}", parsed.url)),
+            rev: parsed.git_ref,
+            ..Default::default()
+        });
+        return Ok((name, spec));
+    }
+
     // Forgejo: explicit `forgejo::host/owner/repo[@ref]` prefix. Checked
     // before the bare `user/repo` heuristic below so a forgejo spec
     // doesn't get misclassified as a malformed GitHub spec.
@@ -94,7 +124,8 @@ fn parse_add_spec(raw: &str, bioc: bool) -> Result<(String, DependencySpec)> {
                 anyhow::bail!(
                     "Unsupported git host '{host}' in '{raw}'. Supported specs: \
                      GitHub via user/repo[@ref], Forgejo via forgejo::host/owner/repo[@ref], \
-                     GitLab via gitlab::host/group/project[@ref].",
+                     GitLab via gitlab::host/group/project[@ref], any git host via \
+                     git::https://host/path/repo.git[@ref].",
                     host = parts[0],
                 );
             }
@@ -474,7 +505,7 @@ async fn probe_bioc(project: &Project, name: &str) -> Option<bool> {
         .map(|bioc| bioc.contains(name))
 }
 
-/// For each git-sourced dep (github, forgejo, or gitlab) in `parsed`, fetch the remote
+/// For each git-sourced dep (github, forgejo, gitlab, or git::) in `parsed`, fetch the remote
 /// DESCRIPTION and replace the URL-derived name with the actual `Package:`
 /// field (uvr-r #8). Mutates in place. Best-effort — every failure path
 /// (transport error, missing DESCRIPTION, malformed file) is logged
@@ -525,6 +556,37 @@ async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Resul
         };
         let git_ref_owned = d.rev.as_deref().unwrap_or("HEAD").to_string();
         let subdirectory = d.subdirectory.clone();
+
+        // `git::` (#190): the DESCRIPTION of the fetched commit. The fetch
+        // goes into the download cache, where `uvr lock` finds it.
+        if let Some(url) = git.strip_prefix("git::") {
+            use uvr_core::registry::git_generic;
+            let found = async {
+                let commit = git_generic::fetch_commit_sha(url, &git_ref_owned).await?;
+                let cache_dir = uvr_core::env_vars::cache_dir_or_temp();
+                git_generic::resolve_git_package_at_commit_bound(&cache_dir, url, &commit, true)
+                    .await
+            }
+            .await;
+            match found {
+                Ok((info, _, _)) if info.name != *provisional_name => {
+                    ui::bullet_dim(format!(
+                        "{} → {} (Package: field in DESCRIPTION)",
+                        palette::dim(provisional_name),
+                        palette::pkg(&info.name)
+                    ));
+                    parsed[idx].0 = info.name;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "DESCRIPTION lookup failed for {git}@{git_ref_owned}: {e}; using {provisional_name} as the package name"
+                    );
+                    fetch_failures += 1;
+                }
+            }
+            continue;
+        }
 
         // Build the raw-DESCRIPTION URL appropriate for the registry. The
         // host's token, if any, goes with it (#187).
@@ -772,6 +834,7 @@ mod tests {
         for bad in [
             "gitlab::gitlab.com/g/p#subdirectory=nested",
             "forgejo::codefloe.com/o/r#subdirectory=nested",
+            "git::https://git.corp.example/team/repo.git#subdirectory=nested",
             "nested#subdirectory=nested",
         ] {
             assert!(parse_add_spec(bad, false).is_err(), "should reject {bad}");
@@ -828,6 +891,10 @@ mod tests {
         assert!(msg.contains("user/repo"), "should list GitHub form: {msg}");
         assert!(msg.contains("forgejo::"), "should list Forgejo form: {msg}");
         assert!(msg.contains("gitlab::"), "should list GitLab form: {msg}");
+        assert!(
+            msg.contains("git::https://"),
+            "should list the git:: form: {msg}"
+        );
         assert!(!msg.contains("Invalid GitHub spec"), "misleading: {msg}");
     }
 
@@ -918,6 +985,68 @@ mod tests {
         assert!(parse_add_spec("gitlab::gitlab.com/onlyone", false).is_err());
         assert!(parse_add_spec("gitlab::/my-group/mypkg", false).is_err());
         assert!(parse_add_spec("gitlab::gitlab.com//mypkg", false).is_err());
+    }
+
+    #[test]
+    fn parse_generic_git_spec_cli() {
+        for (raw, git, rev) in [
+            (
+                "git::https://git.corp.example/team/mypkg.git@abc123",
+                "git::https://git.corp.example/team/mypkg.git",
+                Some("abc123"),
+            ),
+            (
+                "git::https://git.corp.example/team/mypkg.git",
+                "git::https://git.corp.example/team/mypkg.git",
+                None,
+            ),
+            (
+                "git::git@bitbucket.org:team/mypkg.git@v1.0",
+                "git::git@bitbucket.org:team/mypkg.git",
+                Some("v1.0"),
+            ),
+            (
+                "git::ssh://git@host:2222/team/mypkg@feature/x",
+                "git::ssh://git@host:2222/team/mypkg",
+                Some("feature/x"),
+            ),
+        ] {
+            let (name, spec) = parse_add_spec(raw, false).unwrap();
+            assert_eq!(name, "mypkg", "{raw}");
+            let DependencySpec::Detailed(d) = &spec else {
+                panic!("expected Detailed, got {spec:?}");
+            };
+            assert_eq!(d.git.as_deref(), Some(git), "{raw}");
+            assert_eq!(d.rev.as_deref(), rev, "{raw}");
+            assert_eq!(d.subdirectory, None);
+            assert_eq!(
+                format_spec(&spec),
+                format!("{git}@{}", rev.unwrap_or("HEAD"))
+            );
+        }
+    }
+
+    #[test]
+    fn parse_generic_git_spec_cli_rejects_bad_specs() {
+        for (bad, reason) in [
+            ("git::https://tok@git.corp.example/r.git", "credentials"),
+            ("git::-oProxyCommand=touch", "cannot start with `-`"),
+            (
+                "git::https://host/r.git#subdirectory=pkg",
+                "not supported for git::",
+            ),
+            ("git::ftp://host/r.git", "not supported"),
+            ("git::https://host/r.git@", "not a valid git ref"),
+            ("git::https://host", "no repository path"),
+            (
+                "git::https://host/my+pkg.git",
+                "Invalid package name 'my+pkg'",
+            ),
+        ] {
+            let msg = parse_add_spec(bad, false).unwrap_err().to_string();
+            assert!(msg.contains(reason), "{bad}: {msg}");
+            assert!(!msg.contains("tok@"), "{bad}: {msg}");
+        }
     }
 
     #[test]

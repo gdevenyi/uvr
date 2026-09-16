@@ -7,6 +7,19 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Packages from any git host** (#190). A dependency can now name a git
+  repository by its clone URL: `uvr add git::https://git.example.com/team/pkg.git@v1.0`,
+  or `pkg = { git = "git::<url>", rev = "v1.0" }` in `uvr.toml`. This covers
+  Bitbucket, a self-hosted GitLab or Gitea, and company git servers. uvr runs
+  `git` to find and fetch the commit, locks it (`source = "git:<url>"`,
+  `checksum = "git:<sha>"`), installs it from source, and keeps it in the
+  download cache. `https://`, `ssh://` and `user@host:path` URLs work;
+  `http://` and `file://` work with a warning. A private https repository
+  takes `UVR_GIT_TOKEN_<HOST>` (with an optional `UVR_GIT_USER_<HOST>`) or a
+  `~/.netrc` entry; without one, git uses its own credential helpers or ssh
+  keys. `uvr doctor` now shows whether git is installed, and `uvr export`
+  writes these packages as renv `git` remotes.
+
 - **One credential path for GitHub, GitLab and Forgejo** (#187). The three
   git hosts now get their tokens from the same resolver as `[[sources]]`
   repositories, with the same variables and order as before. Private GitHub

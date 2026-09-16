@@ -63,7 +63,8 @@ impl Downloader {
                 let is_binary = spec.is_binary;
                 let user_agent = spec.user_agent.map(str::to_string);
                 // A GitHub/GitLab/Forgejo package: its host's token goes to
-                // the URLs on that host (#187), whichever of them this is.
+                // the URLs on that host (#187), whichever of them this is. A
+                // `git::` package is fetched with git instead (#190).
                 let source = spec.pkg.source.clone();
                 // Binary packages: lockfile checksum is for the source tarball, not the
                 // P3M binary. Skip verification on binary downloads, but keep the
@@ -286,6 +287,20 @@ async fn download_one(
     // R-minor lives in the URL path, so the URL alone already distinguishes
     // them. Keeping the basename suffix preserves the .tar.gz/.tgz extension
     // (source vs binary) and keeps cache entries human-recognizable.
+    // A `git::` package (#190): `url` is the clone URL, the same for every
+    // commit, so git_generic keys its own cache entry by URL and commit.
+    if let Some(GitHost::Git(clone_url)) = git {
+        let commit = expected_checksum
+            .and_then(|c| c.strip_prefix("git:"))
+            .ok_or_else(|| {
+                UvrError::Other(format!(
+                    "Locked git package '{name}' has no `git:<commit>` checksum. Re-run \
+                     `uvr lock`."
+                ))
+            })?;
+        return crate::registry::git_generic::cached_tarball(cache_dir, clone_url, commit).await;
+    }
+
     let fallback_name = format!("{name}_{version}.tar.gz");
     let filename = cache_filename(url, user_agent, &fallback_name);
     let dest = cache_dir.join(&filename);
@@ -304,31 +319,12 @@ async fn download_one(
                 let _ = std::fs::remove_file(&dest);
                 // fall through to re-download
             }
+            // No upstream checksum covers these bytes: `git:` entries (the
+            // lockfile pins a commit, not a tarball hash) and P3M binaries
+            // (the lockfile checksum is for the *source* tarball, checksum
+            // here is None).
             _ => {
-                // No upstream checksum covers these bytes: `git:` entries (the
-                // lockfile pins a commit, not a tarball hash) and P3M binaries
-                // (the lockfile checksum is for the *source* tarball, checksum
-                // here is None). Verify against the sha256 sidecar pinned on
-                // first download (#129, #140).
-                let checksum_path = dest.with_extension("sha256");
-                if let Ok(stored_checksum) = std::fs::read_to_string(&checksum_path) {
-                    let cached = std::fs::read(&dest)?;
-                    if checksum::verify(stored_checksum.trim(), &cached, name).is_ok() {
-                        debug!("Cache hit (sidecar sha256 verified): {filename}");
-                        return Ok(dest);
-                    }
-                    debug!("Cache corrupt for {name}, re-downloading");
-                    let _ = std::fs::remove_file(&dest);
-                    let _ = std::fs::remove_file(&checksum_path);
-                    // fall through to re-download
-                } else {
-                    // No sidecar yet (entry from an older uvr, or a crash
-                    // between download and sidecar write). Backfill it from
-                    // the cached bytes so the entry is pinned from now on
-                    // instead of staying permanently unverified (#140).
-                    let cached = std::fs::read(&dest)?;
-                    write_sidecar(&checksum_path, &checksum::sha256_hex(&cached), name);
-                    debug!("Cache hit (sidecar backfilled): {filename}");
+                if sidecar_cache_hit(&dest, name)? {
                     return Ok(dest);
                 }
             }
@@ -475,11 +471,38 @@ async fn download_one(
     Ok(dest)
 }
 
+/// Whether `dest` is a usable cache entry for bytes that no lockfile
+/// checksum covers: it matches the sha256 sidecar pinned on first download
+/// (#129, #140). A mismatched entry is removed, so the caller downloads
+/// again. An entry with no sidecar yet (from an older uvr, or a crash
+/// between download and sidecar write) is accepted once, and the sidecar is
+/// backfilled so that the entry is pinned from now on.
+pub(crate) fn sidecar_cache_hit(dest: &Path, name: &str) -> Result<bool> {
+    if !dest.exists() {
+        return Ok(false);
+    }
+    let checksum_path = dest.with_extension("sha256");
+    let cached = std::fs::read(dest)?;
+    let Ok(stored_checksum) = std::fs::read_to_string(&checksum_path) else {
+        write_sidecar(&checksum_path, &checksum::sha256_hex(&cached), name);
+        debug!("Cache hit (sidecar backfilled): {}", dest.display());
+        return Ok(true);
+    };
+    if checksum::verify(stored_checksum.trim(), &cached, name).is_ok() {
+        debug!("Cache hit (sidecar sha256 verified): {}", dest.display());
+        return Ok(true);
+    }
+    debug!("Cache corrupt for {name}, re-downloading");
+    let _ = std::fs::remove_file(dest);
+    let _ = std::fs::remove_file(&checksum_path);
+    Ok(false)
+}
+
 /// Write a `.sha256` sidecar next to a cached tarball. Failure is non-fatal —
 /// the cache entry still works and the sidecar is backfilled on the next hit —
 /// but it must not be silent (#140): without the sidecar the entry cannot be
 /// integrity-verified.
-fn write_sidecar(checksum_path: &Path, checksum: &str, name: &str) {
+pub(crate) fn write_sidecar(checksum_path: &Path, checksum: &str, name: &str) {
     if let Err(e) = std::fs::write(checksum_path, checksum) {
         tracing::warn!(
             "{name}: failed to write checksum sidecar {}: {e} — cached file stays unverified until the sidecar can be written",
@@ -610,6 +633,62 @@ mod tests {
         let stored = std::fs::read_to_string(dest.with_extension("sha256"))
             .expect("git sidecar must be backfilled");
         assert_eq!(stored.trim(), checksum::sha256_hex(bytes));
+    }
+
+    // #190: a `git::` package downloads as the archive of its locked
+    // commit, keyed by commit (the clone URL is the same for all of them),
+    // and a cached archive needs no fetch.
+    #[tokio::test]
+    async fn git_package_downloads_its_commit_once() {
+        use crate::lockfile::{LockedPackage, PackageSource};
+        use crate::registry::git_generic::TestRepo;
+
+        let Some(repo) = TestRepo::new() else { return };
+        let locked = |commit: Option<&str>| LockedPackage {
+            name: "gitpkg".into(),
+            version: "0.1.0".into(),
+            source: PackageSource::Git {
+                url: repo.url.clone(),
+            },
+            raw_version: None,
+            url: None,
+            checksum: commit.map(|c| format!("git:{c}")),
+            subdirectory: None,
+            requires: vec![],
+            system_requirements: None,
+            dev: false,
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let download = |pkg: LockedPackage| {
+            let cache = cache.path().to_path_buf();
+            let url = repo.url.clone();
+            async move {
+                super::Downloader::new(reqwest::Client::new(), cache, 1)
+                    .download_all(&[super::DownloadSpec {
+                        pkg: &pkg,
+                        url: &url,
+                        fallback_url: None,
+                        is_binary: false,
+                        user_agent: None,
+                    }])
+                    .await
+                    .map(|mut results| results.remove(0))
+            }
+        };
+
+        let first = download(locked(Some(&repo.first))).await.unwrap();
+        assert!(!first.used_binary);
+        let meta = crate::installer::binary_install::inspect_tarball(&first.path, "gitpkg");
+        assert!(meta.is_some_and(|m| m.pure_r), "{}", first.path.display());
+        let second = download(locked(Some(&repo.second))).await.unwrap();
+        assert_ne!(first.path, second.path);
+
+        std::fs::remove_dir_all(repo.dir.path()).unwrap();
+        let again = download(locked(Some(&repo.first))).await.unwrap();
+        assert_eq!(again.path, first.path);
+
+        let err = download(locked(None)).await.err().unwrap().to_string();
+        assert!(err.contains("no `git:<commit>` checksum"), "{err}");
     }
 
     // #122: the Linux collision. PPM serves a different-R-ABI binary at the

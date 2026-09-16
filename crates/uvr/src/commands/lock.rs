@@ -12,6 +12,7 @@ use uvr_core::registry::forgejo::{
     fetch_commit_sha as fetch_forgejo_commit_sha, parse_forgejo_spec,
     resolve_forgejo_package_with_remote_entries_and_install_dependencies_at_commit_bound,
 };
+use uvr_core::registry::git_generic;
 use uvr_core::registry::github::{
     fetch_commit_sha, parse_github_spec, resolve_github_package_with_remote_entries_at_commit_bound,
 };
@@ -276,10 +277,14 @@ enum GitKind {
     GitHub,
     Forgejo,
     Gitlab,
+    /// `git::<clone URL>`, any host (#190). `repository` is the URL.
+    Git,
 }
 
 fn classify_git(git: &str) -> GitKind {
-    if git.starts_with("forgejo::") {
+    if git.starts_with("git::") {
+        GitKind::Git
+    } else if git.starts_with("forgejo::") {
         GitKind::Forgejo
     } else if git.starts_with("gitlab::") {
         GitKind::Gitlab
@@ -350,7 +355,7 @@ impl GitRequest {
             provider: self.provider,
             repository: match self.provider {
                 GitKind::GitHub => self.repository.to_ascii_lowercase(),
-                GitKind::Forgejo | GitKind::Gitlab => self.repository.clone(),
+                GitKind::Forgejo | GitKind::Gitlab | GitKind::Git => self.repository.clone(),
             },
             requested_ref: self.requested_ref.clone(),
             subdirectory: self.subdirectory.clone(),
@@ -370,24 +375,30 @@ impl GitRequest {
         rev: Option<&str>,
         subdirectory: Option<&str>,
     ) -> Result<Self> {
-        let spec = match rev {
-            Some(rev) => format!("{git}@{rev}"),
-            None => git.to_string(),
-        };
-        let provider = classify_git(&spec);
-        let Some((repository, requested_ref)) = parse_request_spec(provider, &spec) else {
-            anyhow::bail!(
-                "manifest git dependency '{name}' declares an unparseable git source '{git}'{rev}; \
-                 refusing registry fallback",
-                rev = match rev {
-                    Some(rev) => format!(" with rev '{rev}'"),
-                    None => String::new(),
-                }
-            );
-        };
+        let provider = classify_git(git);
+        let (repository, requested_ref) =
+            parse_request_spec(provider, git, rev).map_err(|reason| {
+                anyhow::anyhow!(
+                    "manifest git dependency '{name}' declares an unparseable git source \
+                     '{git}'{rev}{reason}; refusing registry fallback",
+                    git = uvr_core::auth::redact_url(git),
+                    rev = match rev {
+                        Some(rev) => format!(" with rev '{rev}'"),
+                        None => String::new(),
+                    },
+                    reason = if reason.is_empty() {
+                        reason
+                    } else {
+                        format!(": {reason}")
+                    },
+                )
+            })?;
         // `rsplit` always yields at least one segment; the whole repository
         // string is the right fallback for a source without a `/`.
-        let canonical_name = repository.rsplit('/').next().unwrap_or(repository.as_str());
+        let canonical_name = match provider {
+            GitKind::Git => git_generic::repo_name(&repository),
+            _ => repository.rsplit('/').next().unwrap_or(repository.as_str()),
+        };
         let binding = if exact || subdirectory.is_some() || name != canonical_name {
             NameBinding::Exact(name.to_string())
         } else {
@@ -441,6 +452,7 @@ impl std::fmt::Display for GitRequest {
             GitKind::GitHub => write!(f, "{}@{}", self.repository, self.requested_ref)?,
             GitKind::Forgejo => write!(f, "forgejo::{}@{}", self.repository, self.requested_ref)?,
             GitKind::Gitlab => write!(f, "gitlab::{}@{}", self.repository, self.requested_ref)?,
+            GitKind::Git => write!(f, "git::{}@{}", self.repository, self.requested_ref)?,
         }
         if let Some(subdirectory) = &self.subdirectory {
             write!(f, "#subdirectory={subdirectory}")?;
@@ -449,8 +461,19 @@ impl std::fmt::Display for GitRequest {
     }
 }
 
-fn parse_request_spec(provider: GitKind, spec: &str) -> Option<(String, String)> {
-    match provider {
+/// `(repository, ref)` of a manifest `git` value and its `rev`, or why it
+/// does not parse (an empty reason if the parser gives none).
+fn parse_request_spec(
+    provider: GitKind,
+    git: &str,
+    rev: Option<&str>,
+) -> std::result::Result<(String, String), String> {
+    let spec = match rev {
+        Some(rev) => format!("{git}@{rev}"),
+        None => git.to_string(),
+    };
+    let spec = spec.as_str();
+    let parsed = match provider {
         GitKind::GitHub => parse_github_spec(spec)
             .map(|(owner, repo, git_ref)| (format!("{owner}/{repo}"), git_ref)),
         GitKind::Forgejo => {
@@ -463,7 +486,15 @@ fn parse_request_spec(provider: GitKind, spec: &str) -> Option<(String, String)>
             parse_gitlab_spec(body)
                 .map(|(host, project, git_ref)| (format!("{host}/{project}"), git_ref))
         }
-    }
+        // The URL can hold `@` and `:`, so `rev` is not joined to it.
+        GitKind::Git => {
+            return git_generic::manifest_spec(git, rev).map(|spec| {
+                let git_ref = spec.git_ref.unwrap_or_else(|| "HEAD".to_string());
+                (spec.url, git_ref)
+            })
+        }
+    };
+    parsed.ok_or_else(String::new)
 }
 
 /// Seed the remote walk from manifest `git = "..."` dependencies. Propagates
@@ -556,7 +587,7 @@ fn commit_identity(request: &GitRequest) -> CommitIdentity {
         provider: request.provider,
         repository: match request.provider {
             GitKind::GitHub => request.repository.to_ascii_lowercase(),
-            GitKind::Forgejo | GitKind::Gitlab => request.repository.clone(),
+            GitKind::Forgejo | GitKind::Gitlab | GitKind::Git => request.repository.clone(),
         },
         requested_ref: request.requested_ref.clone(),
     }
@@ -684,6 +715,25 @@ async fn resolve_git_deps(
                             request.binding.is_bound(),
                         )
                     }
+                    .await
+                    .map_err(Into::into),
+                    Err(error) => Err(error),
+                }
+            }
+            GitKind::Git => {
+                let url = request.repository.as_str();
+                let commit_key = commit_identity(&request);
+                match memoized_commit(&mut commit_memo, commit_key, || {
+                    git_generic::fetch_commit_sha(url, &request.requested_ref)
+                })
+                .await
+                {
+                    Ok(commit) => git_generic::resolve_git_package_at_commit_bound(
+                        &uvr_core::env_vars::cache_dir_or_temp(),
+                        url,
+                        &commit,
+                        request.binding.is_bound(),
+                    )
                     .await
                     .map_err(Into::into),
                     Err(error) => Err(error),
@@ -1143,9 +1193,60 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
+    // #190: a `git::` dependency keeps its URL as the repository, its `rev`
+    // apart from the URL, and binds its name only when the manifest key is
+    // not the repository name.
+    #[test]
+    fn generic_git_manifest_requests_parse_without_joining_rev() {
+        let request = |name: &str, git: &str, rev: Option<&str>| {
+            let mut manifest = uvr_core::manifest::Manifest::new("t", None);
+            manifest.add_dep(name.into(), git_dep(git, rev, None), false);
+            collect_git_requests(&manifest).map(|mut queue| queue.pop_front().unwrap())
+        };
+
+        let plain = request("repo", "git::git@host:team/repo.git", Some("v1")).unwrap();
+        assert_eq!(plain.provider, GitKind::Git);
+        assert_eq!(plain.repository, "git@host:team/repo.git");
+        assert_eq!(plain.requested_ref, "v1");
+        assert_eq!(plain.binding, NameBinding::None);
+        assert_eq!(plain.to_string(), "git::git@host:team/repo.git@v1");
+
+        let head = request("repo", "git::https://Host.example/Team/repo.git", None).unwrap();
+        assert_eq!(head.requested_ref, "HEAD");
+        // A URL is not case-folded like a GitHub owner/repo.
+        assert_eq!(
+            head.identity().repository,
+            "https://Host.example/Team/repo.git"
+        );
+
+        let aliased = request("anypkg", "git::git@host:repo.git", Some("main")).unwrap();
+        assert_eq!(aliased.repository, "git@host:repo.git");
+        assert_eq!(aliased.binding, NameBinding::Exact("anypkg".into()));
+
+        let error = request("repo", "git::https://tok@host/repo.git", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing registry fallback")
+                && error.contains("credentials")
+                && error.contains("https://***@host/repo.git"),
+            "{error}"
+        );
+        assert!(!error.contains("tok@"), "{error}");
+        let error = request("repo", "git::https://host/repo.git@v1", Some("v2"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("given twice"), "{error}");
+    }
+
     #[test]
     fn commit_identity_is_shared_by_bound_and_unbound_requests_for_every_provider() {
-        for provider in [GitKind::GitHub, GitKind::Forgejo, GitKind::Gitlab] {
+        for provider in [
+            GitKind::GitHub,
+            GitKind::Forgejo,
+            GitKind::Gitlab,
+            GitKind::Git,
+        ] {
             let unbound = GitRequest {
                 provider,
                 repository: "host/owner/repo".into(),
@@ -1195,5 +1296,11 @@ mod tests {
             classify_git("gitlab::gitlab.com/my-group/mypkg"),
             GitKind::Gitlab
         );
+        assert_eq!(
+            classify_git("git::https://git.corp.example/team/repo.git"),
+            GitKind::Git
+        );
+        // A GitHub repository named like a prefix is still GitHub.
+        assert_eq!(classify_git("git/git"), GitKind::GitHub);
     }
 }

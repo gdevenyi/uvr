@@ -79,6 +79,11 @@ pub enum PackageSource {
     Gitlab {
         host: String,
     },
+    /// A package from any git host, fetched with `git` (#190). `url` is the
+    /// clone URL. Serializes as `"git:<url>"` in the lockfile.
+    Git {
+        url: String,
+    },
     Local,
     /// A custom CRAN-like repository (r-multiverse, r-universe, PPM, etc.)
     Custom {
@@ -126,6 +131,14 @@ impl<'de> Deserialize<'de> for PackageSource {
                         });
                     }
                 }
+                // And for `git:<url>`.
+                if let Some(url) = s.strip_prefix("git:") {
+                    if !url.is_empty() {
+                        return Ok(PackageSource::Git {
+                            url: url.to_string(),
+                        });
+                    }
+                }
                 PackageSource::Custom { name: s }
             }
         })
@@ -140,6 +153,7 @@ impl std::fmt::Display for PackageSource {
             PackageSource::GitHub => write!(f, "github"),
             PackageSource::Forgejo { host } => write!(f, "forgejo:{host}"),
             PackageSource::Gitlab { host } => write!(f, "gitlab:{host}"),
+            PackageSource::Git { url } => write!(f, "git:{url}"),
             PackageSource::Local => write!(f, "local"),
             PackageSource::Custom { name } => write!(f, "{name}"),
         }
@@ -410,6 +424,56 @@ source = "gitlab:git.local:3000"
         assert!(s.contains(r#"source = "gitlab:git.local:3000""#));
         let lf2: Lockfile = s.parse().unwrap();
         assert_eq!(lf, lf2);
+    }
+
+    // #190: a generic git package locks its clone URL in `source` and its
+    // commit in `checksum`, with no `url` line. The URL keeps its own `:`
+    // and `@` characters.
+    #[test]
+    fn round_trip_git_source() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        for url in [
+            "https://git.corp.example/team/repo.git",
+            "ssh://git@git.corp.example:2222/team/repo.git",
+            "git@bitbucket.org:team/repo.git",
+        ] {
+            let input = format!(
+                "[r]\nversion = \"4.4.2\"\n\n[[package]]\nname = \"anypkg\"\n\
+                 version = \"0.1.0\"\nsource = \"git:{url}\"\nchecksum = \"git:{sha}\"\n"
+            );
+            let lf: Lockfile = input.parse().expect("parse git source");
+            let pkg = &lf.packages[0];
+            assert_eq!(pkg.source, PackageSource::Git { url: url.into() });
+            assert_eq!(pkg.url, None);
+
+            let s = lf.to_toml_string().unwrap();
+            assert_eq!(s, input, "a git lockfile round-trips byte for byte");
+            assert_eq!(s.parse::<Lockfile>().unwrap(), lf);
+        }
+    }
+
+    #[test]
+    fn git_source_empty_url_falls_to_custom() {
+        let input = "[r]\nversion = \"4.4.2\"\n\n[[package]]\nname = \"x\"\n\
+                     version = \"0.1.0\"\nsource = \"git:\"\n";
+        let lf: Lockfile = input.parse().expect("parse");
+        assert!(matches!(
+            lf.packages[0].source,
+            PackageSource::Custom { ref name } if name == "git:"
+        ));
+    }
+
+    // #190: a lockfile without git sources is written exactly as before.
+    #[test]
+    fn lockfile_without_git_sources_is_unchanged() {
+        let input = "[r]\nversion = \"4.4.2\"\n\n[[package]]\nname = \"ggplot2\"\n\
+                     version = \"3.4.4\"\nsource = \"cran\"\n\
+                     url = \"https://cran.r-project.org/src/contrib/ggplot2_3.4.4.tar.gz\"\n\
+                     checksum = \"sha256:abc123\"\nrequires = [\"scales\"]\n\n\
+                     [[package]]\nname = \"mypkg\"\nversion = \"0.1.0\"\n\
+                     source = \"forgejo:codefloe.com\"\n";
+        let lf: Lockfile = input.parse().unwrap();
+        assert_eq!(lf.to_toml_string().unwrap(), input);
     }
 
     #[test]

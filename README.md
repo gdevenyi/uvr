@@ -221,6 +221,7 @@ uvr add DESeq2 --bioc
 uvr add tidymodels@>=1.0.0
 uvr add user/repo@main
 uvr add 'user/monorepo@main#subdirectory=packages/nestedPkg'
+uvr add ../mypkg              # a package directory next to the project
 
 # Install everything from the lockfile
 uvr sync
@@ -235,7 +236,7 @@ uvr tree
 GitHub package directories also propagate through supported DESCRIPTION
 `Remotes:` entries, including `owner/repo/subdir@ref` and
 `owner/repo:subdir@ref`. This traversal follows the source chain: only a
-package already selected from a manifest Git source can introduce another
+package already selected from a manifest Git or path source can introduce another
 remote source; ordinary registry packages cannot inject remote URLs. Bound
 aliases and subdirectory targets fail rather than falling back to a registry
 or to the repository root.
@@ -465,10 +466,18 @@ dplyr = "*"
 DESeq2 = { bioc = true }
 myPkg = { git = "user/repo", rev = "main" }
 nestedPkg = { git = "user/monorepo", rev = "main", subdirectory = "packages/nestedPkg" }
+mypkg = { path = "../mypkg" }
 
 [dev-dependencies]
 testthat = "*"
 ```
+
+A `path` is relative to `uvr.toml` (or absolute). `uvr add` needs explicit
+path syntax (`./x`, `../x`, `/x`), so a bare name stays a CRAN or GitHub spec.
+`uvr sync` rebuilds a path package from its directory on every run, so edits
+arrive without a version bump. The lockfile records only the path and the
+DESCRIPTION version, so it installs only where that directory exists, and
+`uvr sync --frozen` warns about it.
 
 Generated or imported git entries may also carry `exact = true`, which preserves an explicit DESCRIPTION `PackageName=` alias and requires the fetched DESCRIPTION `Package:` field to match the manifest dependency name.
 

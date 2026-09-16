@@ -92,6 +92,13 @@ impl DependencySpec {
             _ => None,
         }
     }
+
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            DependencySpec::Detailed(d) => d.path.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 impl Default for DependencySpec {
@@ -125,6 +132,10 @@ pub struct DetailedDep {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subdirectory: Option<String>,
+
+    /// Local package source directory, relative to `uvr.toml` or absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -147,7 +158,7 @@ impl std::str::FromStr for Manifest {
 
         // Validate [dependencies] and [dev-dependencies]: every value must be
         // a string (bare version) or a table whose keys are known DetailedDep
-        // fields {version, bioc, git, exact, rev, subdirectory}. A TOML table-header entry like
+        // fields {version, bioc, git, exact, rev, subdirectory, path}. A TOML table-header entry like
         // `[dependencies.data.table]` creates a nested table under key `data`
         // with a sub-key `table` — not a valid DetailedDep field. This check
         // catches that case before serde silently resolves the wrong package.
@@ -155,7 +166,15 @@ impl std::str::FromStr for Manifest {
         // NOTE: `VALID_DEP_KEYS` must list every field of `DetailedDep`. A
         // field added to that struct without updating this slice will cause
         // valid manifests to be rejected — keep them in sync.
-        const VALID_DEP_KEYS: &[&str] = &["version", "bioc", "git", "exact", "rev", "subdirectory"];
+        const VALID_DEP_KEYS: &[&str] = &[
+            "version",
+            "bioc",
+            "git",
+            "exact",
+            "rev",
+            "subdirectory",
+            "path",
+        ];
 
         for section in &["dependencies", "dev-dependencies"] {
             if let Some(toml::Value::Table(deps)) = raw.get(*section) {
@@ -427,6 +446,26 @@ impl Manifest {
 }
 
 fn validate_detailed_dependency(name: &str, section: &str, dep: &DetailedDep) -> Result<()> {
+    if let Some(path) = dep.path.as_deref() {
+        let conflict = [
+            ("git", dep.git.is_some()),
+            ("rev", dep.rev.is_some()),
+            ("bioc", dep.bioc.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(field, set)| set.then_some(field));
+        if let Some(field) = conflict {
+            return Err(UvrError::ManifestParse(format!(
+                "dependency `{name}` in [{section}]: `path` cannot be combined with `{field}`."
+            )));
+        }
+        if path.trim().is_empty() {
+            return Err(UvrError::ManifestParse(format!(
+                "dependency `{name}` in [{section}]: `path` must not be empty."
+            )));
+        }
+    }
+
     if dep.exact {
         let git = dep
             .git
@@ -1011,6 +1050,72 @@ rev = "main"
         let toml_str = m.to_toml_string().expect("serialize");
         let m2: Manifest = toml_str.parse().expect("reparse");
         assert_eq!(m, m2);
+    }
+
+    #[test]
+    fn manifest_without_path_round_trips_byte_for_byte() {
+        let input = r#"[project]
+name = "my-project"
+r_version = ">=4.0.0"
+
+[dependencies]
+dplyr = "*"
+
+[dependencies.myPkg]
+git = "user/repo"
+rev = "main"
+"#;
+        let m: Manifest = input.parse().unwrap();
+        assert_eq!(m.to_toml_string().unwrap(), input);
+    }
+
+    #[test]
+    fn path_dependency_round_trips() {
+        let input = r#"[project]
+name = "my-project"
+
+[dependencies.mypkg]
+path = "../mypkg"
+
+[dev-dependencies.abs]
+version = ">=1.0"
+path = "/srv/abs"
+"#;
+        let m: Manifest = input.parse().unwrap();
+        assert_eq!(m.dependencies["mypkg"].path(), Some("../mypkg"));
+        assert_eq!(m.dependencies["mypkg"].git(), None);
+        assert_eq!(m.dev_dependencies["abs"].path(), Some("/srv/abs"));
+        assert_eq!(m.dev_dependencies["abs"].version_req(), Some(">=1.0"));
+        assert_eq!(m.to_toml_string().unwrap(), input);
+
+        // The inline form from the docs parses to the same thing.
+        let inline: Manifest = "[project]\nname = \"p\"\n\n[dependencies]\n\
+                                mypkg = { path = \"../mypkg\" }\n"
+            .parse()
+            .unwrap();
+        assert_eq!(inline.dependencies["mypkg"], m.dependencies["mypkg"]);
+    }
+
+    #[test]
+    fn path_dependency_rejects_other_sources_and_empty_paths() {
+        for (extra, field) in [
+            ("git = \"user/repo\"", "`git`"),
+            ("rev = \"main\"", "`rev`"),
+            ("bioc = true", "`bioc`"),
+        ] {
+            let toml = format!(
+                "[project]\nname = \"p\"\n\n[dependencies]\n\
+                 mypkg = {{ path = \"../mypkg\", {extra} }}\n"
+            );
+            let err = toml.parse::<Manifest>().unwrap_err().to_string();
+            assert!(err.contains("`path` cannot be combined with"), "{err}");
+            assert!(err.contains(field), "{err}");
+        }
+        let err = "[project]\nname = \"p\"\n\n[dependencies]\nmypkg = { path = \" \" }\n"
+            .parse::<Manifest>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`path` must not be empty"), "{err}");
     }
 
     const DESCRIPTION_SAMPLE: &str = r#"Package: myanalysis

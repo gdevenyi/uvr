@@ -192,7 +192,7 @@ async fn resolve_lockfile(
         }
         Ok::<_, anyhow::Error>(regs)
     };
-    let git_fut = resolve_git_deps(client, &project.manifest);
+    let git_fut = resolve_git_deps(client, &project.manifest, &project.root);
 
     let (cran_result, bioc_result, git_result, custom_result) =
         tokio::join!(cran_fut, bioc_fut, git_fut, custom_fut,);
@@ -570,16 +570,70 @@ where
     fetched.map_err(anyhow::Error::msg)
 }
 
+/// Seed `pre_resolved` with the manifest's `path` dependencies, read from
+/// disk relative to `root` (the manifest directory). A path package is a
+/// direct, user-chosen source like a manifest git dependency, so its
+/// DESCRIPTION `Remotes:` are queued for the git walk too.
+fn seed_local_deps(
+    manifest: &uvr_core::manifest::Manifest,
+    root: &std::path::Path,
+    queue: &mut VecDeque<GitRequest>,
+    pre_resolved: &mut HashMap<String, PackageInfo>,
+    resolved_from: &mut HashMap<String, String>,
+) -> Result<()> {
+    for (key, spec) in manifest
+        .dependencies
+        .iter()
+        .chain(manifest.dev_dependencies.iter())
+    {
+        let Some(path) = spec.path() else {
+            continue;
+        };
+        let (info, remotes, dependencies) =
+            uvr_core::registry::local::resolve_local_package(root, path)
+                .with_context(|| format!("Failed to read local dependency '{key}'"))?;
+        // The resolver looks the manifest key up in `pre_resolved`; a
+        // different DESCRIPTION name would send the key to a registry.
+        if info.name != *key {
+            anyhow::bail!(
+                "manifest path dependency '{key}' points at '{path}', whose DESCRIPTION \
+                 declares Package: '{}'; rename the dependency to match or fix the path",
+                info.name
+            );
+        }
+        if let Some(previous) = pre_resolved.get(key) {
+            if previous.source != info.source {
+                anyhow::bail!(
+                    "'{key}' is declared with two different local paths; keep one of them"
+                );
+            }
+            continue;
+        }
+        resolved_from.insert(key.clone(), format!("path {path}"));
+        pre_resolved.insert(key.clone(), info);
+        enqueue_remote_entries(queue, remotes, &dependencies)?;
+    }
+    Ok(())
+}
+
 /// Resolve source-chained git dependencies. Bound requests are required and
 /// enforce DESCRIPTION identity; unbound root hints may fall back to registries.
 /// Commit identity is memoized separately from bound resolution identity.
 async fn resolve_git_deps(
     client: &reqwest::Client,
     manifest: &uvr_core::manifest::Manifest,
+    root: &std::path::Path,
 ) -> Result<HashMap<String, PackageInfo>> {
     let mut queue = collect_git_requests(manifest)?;
     let mut pre_resolved: HashMap<String, PackageInfo> = HashMap::new();
     let mut resolved_from: HashMap<String, String> = HashMap::new();
+    seed_local_deps(
+        manifest,
+        root,
+        &mut queue,
+        &mut pre_resolved,
+        &mut resolved_from,
+    )?;
     let mut outcomes: HashMap<RequestIdentity, std::result::Result<String, String>> =
         HashMap::new();
     let mut commit_memo: HashMap<CommitIdentity, std::result::Result<String, String>> =
@@ -1173,6 +1227,86 @@ mod tests {
             &a,
             &package_info("1.0.1", sha, Some("pkgs/a"))
         ));
+    }
+
+    fn path_dep(path: &str) -> DependencySpec {
+        DependencySpec::Detailed(uvr_core::manifest::DetailedDep {
+            path: Some(path.to_string()),
+            ..Default::default()
+        })
+    }
+
+    fn seed(
+        manifest: &uvr_core::manifest::Manifest,
+        root: &std::path::Path,
+    ) -> Result<(VecDeque<GitRequest>, HashMap<String, PackageInfo>)> {
+        let mut queue = VecDeque::new();
+        let mut pre_resolved = HashMap::new();
+        seed_local_deps(
+            manifest,
+            root,
+            &mut queue,
+            &mut pre_resolved,
+            &mut HashMap::new(),
+        )?;
+        Ok((queue, pre_resolved))
+    }
+
+    #[test]
+    fn path_deps_are_read_relative_to_the_manifest_and_seed_their_remotes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(tmp.path().join("mypkg")).unwrap();
+        std::fs::write(
+            tmp.path().join("mypkg/DESCRIPTION"),
+            "Package: mypkg\nVersion: 0.2.0\nImports: helper\nRemotes: owner/helper\n",
+        )
+        .unwrap();
+        let mut manifest = uvr_core::manifest::Manifest::new("t", None);
+        manifest.add_dep("mypkg".into(), path_dep("../mypkg"), true);
+
+        let (queue, pre_resolved) = seed(&manifest, &root).unwrap();
+        let info = &pre_resolved["mypkg"];
+        assert_eq!(info.version.to_string(), "0.2.0");
+        assert_eq!(
+            info.source,
+            uvr_core::lockfile::PackageSource::Local {
+                path: "../mypkg".into()
+            }
+        );
+        // A path package is a manifest source: its `Remotes:` join the walk,
+        // bound to its own install-time dependencies like a git parent's.
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].repository, "owner/helper");
+        assert_eq!(queue[0].origin, RequestOrigin::Transitive);
+    }
+
+    #[test]
+    fn path_dep_errors_name_the_dependency_and_never_fall_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("actual")).unwrap();
+        std::fs::write(
+            tmp.path().join("actual/DESCRIPTION"),
+            "Package: actual\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+
+        let mut renamed = uvr_core::manifest::Manifest::new("t", None);
+        renamed.add_dep("alias".into(), path_dep("actual"), false);
+        let err = format!("{:#}", seed(&renamed, tmp.path()).unwrap_err());
+        assert!(
+            err.contains("'alias'") && err.contains("Package: 'actual'"),
+            "{err}"
+        );
+
+        let mut missing = uvr_core::manifest::Manifest::new("t", None);
+        missing.add_dep("gone".into(), path_dep("gone"), false);
+        let err = format!("{:#}", seed(&missing, tmp.path()).unwrap_err());
+        assert!(
+            err.contains("'gone'") && err.contains("does not exist"),
+            "{err}"
+        );
     }
 
     #[test]

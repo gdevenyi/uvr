@@ -82,8 +82,9 @@ fn select_pkg_plan<'a>(
 ) -> PkgPlan<'a> {
     let source_url_str = source_url(p, bioc_release);
 
-    // A nested package only exists inside its repository archive; a same-name binary is a different package.
-    if p.subdirectory.is_some() {
+    // A nested package only exists inside its repository archive, and a path
+    // package only in its directory; a same-name binary is a different package.
+    if p.subdirectory.is_some() || is_local(p) {
         return PkgPlan {
             pkg: p,
             url: source_url_str,
@@ -213,6 +214,10 @@ pub async fn run_inner(
     }
 
     if frozen {
+        // Before the re-resolve, so the warning shows even when that fails.
+        if let Some(warning) = local_packages_warning(&lockfile) {
+            ui::warn(warning);
+        }
         let fresh = crate::commands::lock::resolve_only(project)
             .await
             .context("Failed to re-resolve dependencies for --frozen check")?;
@@ -534,12 +539,13 @@ async fn install_from_lockfile_with_r(
     let mut new_count = 0usize;
     let mut upgrade_count = 0usize;
     for pkg in &to_install {
-        let old_ver = installed_version(&pkg.name, &library);
-        if let Some(old) = &old_ver {
-            ui::row_upgrade(&pkg.name, old, &pkg.version);
-            upgrade_count += 1;
-        } else {
-            new_count += 1;
+        match installed_version(&pkg.name, &library) {
+            // A path package rebuilt at the version it already has is no upgrade.
+            Some(old) if !(is_local(pkg) && version_matches(&old, pkg)) => {
+                ui::row_upgrade(&pkg.name, &old, &pkg.version);
+                upgrade_count += 1;
+            }
+            _ => new_count += 1,
         }
     }
 
@@ -644,7 +650,9 @@ async fn install_from_lockfile_with_r(
     }
 
     for pkg in &to_install {
-        if ignore_cache {
+        // A path package's content can change without its version, so it is
+        // never served from (or stored in) the global package cache.
+        if ignore_cache || is_local(pkg) {
             cache_misses.push(pkg);
             continue;
         }
@@ -709,7 +717,7 @@ async fn install_from_lockfile_with_r(
         _ => None,
     };
 
-    let plans: Vec<PkgPlan> = if !cache_misses.is_empty() {
+    let plans: Vec<PkgPlan> = if cache_misses.iter().any(|p| !is_local(p)) {
         // Re-fetch each [[sources]] (HTTP-cached → 304 normally) and partition
         // into binary-capable vs. source-only. A registry is "binary-capable"
         // when at least one of its PACKAGES entries has a Built: line that
@@ -791,7 +799,11 @@ async fn install_from_lockfile_with_r(
             })
             .collect()
     } else {
-        Vec::new()
+        // Nothing (or only path packages) to fetch: skip the index round trips.
+        cache_misses
+            .iter()
+            .map(|p| select_pkg_plan(p, &[], None, &host_info.triple, &r_minor_str, bioc_release))
+            .collect()
     };
 
     // Guard against packages with no download URL.
@@ -801,6 +813,12 @@ async fn install_from_lockfile_with_r(
                 "Package '{}' has no download URL. Re-run `uvr lock` to regenerate the lockfile.",
                 plan.pkg.name
             );
+        }
+        // Sync does not re-resolve, so a lock taken to another machine (or a
+        // moved directory) must fail here, before anything is downloaded.
+        if let uvr_core::lockfile::PackageSource::Local { path } = &plan.pkg.source {
+            uvr_core::registry::local::resolve_local_package(&project.root, path)
+                .with_context(|| format!("Cannot install path package '{}'", plan.pkg.name))?;
         }
     }
 
@@ -831,6 +849,7 @@ async fn install_from_lockfile_with_r(
         let specs: Vec<DownloadSpec> = plans
             .iter()
             .zip(auth_headers.iter())
+            .filter(|(p, _)| !is_local(p.pkg))
             .map(|(p, auth)| DownloadSpec {
                 pkg: p.pkg,
                 url: &p.url,
@@ -854,10 +873,27 @@ async fn install_from_lockfile_with_r(
         // Cloned rather than moved: the sysreqs check below still needs the
         // client, and it now runs after the download phase (#207).
         let downloader = Downloader::new(client.clone(), cache_dir, jobs);
-        let results = downloader
+        let mut downloaded = downloader
             .download_all(&specs)
             .await
-            .context("Download failed")?;
+            .context("Download failed")?
+            .into_iter();
+        // Path packages build straight from their directory. Splice them back
+        // in plan order, which keeps the whole install topologically sorted.
+        let results: Vec<uvr_core::installer::download::DownloadResult> = plans
+            .iter()
+            .map(|p| match &p.pkg.source {
+                uvr_core::lockfile::PackageSource::Local { path } => {
+                    Ok(uvr_core::installer::download::DownloadResult {
+                        path: project.root.join(path),
+                        used_binary: false,
+                    })
+                }
+                _ => downloaded
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing download for {}", p.pkg.name)),
+            })
+            .collect::<Result<_>>()?;
 
         // Phase: pre-sniff every downloaded tarball so the upfront message and
         // "no binary repo" hint both reflect runtime classification rather than
@@ -869,7 +905,7 @@ async fn install_from_lockfile_with_r(
             .iter()
             .zip(results.iter())
             .map(|(plan, result)| {
-                if plan.pkg.subdirectory.is_some() {
+                if plan.pkg.subdirectory.is_some() || is_local(plan.pkg) {
                     return InstallKind::Source;
                 }
                 if result.used_binary {
@@ -962,10 +998,14 @@ async fn install_from_lockfile_with_r(
         // "No binary repo" hint — only fires when no packages were binary and at
         // least one real source build (compilation) is needed. Pure-R alone doesn't
         // indicate "no binaries available" — those packages simply have no binary form.
-        if runtime_binary == 0 && runtime_source > 0 && !plans.is_empty() {
+        // Path packages are always built from their directory, so they say
+        // nothing about binary availability.
+        let remote_source =
+            runtime_source.saturating_sub(plans.iter().filter(|p| is_local(p.pkg)).count());
+        if runtime_binary == 0 && remote_source > 0 && !plans.is_empty() {
             println!(
                 "  i  No binary repo for {} on R {}; compiling {} package(s) from source.",
-                host_info.distro_label, r_minor_str, runtime_source
+                host_info.distro_label, r_minor_str, remote_source
             );
         }
 
@@ -993,7 +1033,13 @@ async fn install_from_lockfile_with_r(
                             .system_requirements
                             .clone()
                             .or_else(|| tarball_sysreqs(&p.name, &plans, &results)),
-                        bioc: matches!(p.source, uvr_core::lockfile::PackageSource::Bioconductor),
+                        // A path package's name is no CRAN identity either, so
+                        // it takes the local-rules route like Bioconductor.
+                        bioc: matches!(
+                            p.source,
+                            uvr_core::lockfile::PackageSource::Bioconductor
+                                | uvr_core::lockfile::PackageSource::Local { .. }
+                        ),
                     })
                     .collect();
 
@@ -1353,6 +1399,9 @@ async fn install_from_lockfile_with_r(
                 r_minor: r_minor_str.clone(),
                 is_binary: cache_key_binary,
             };
+            if is_local(plan.pkg) {
+                continue; // never cached; see the lookup above
+            }
             if let Err(e) = package_cache::store(&pkg_dir, &key, &plan.pkg.name, Some(&entry_meta))
             {
                 tracing::debug!("Failed to cache {}: {e}", plan.pkg.name);
@@ -1642,7 +1691,38 @@ fn validate_lock_identity(lockfile: &Lockfile) -> Result<()> {
     Ok(())
 }
 
+fn is_local(pkg: &LockedPackage) -> bool {
+    matches!(pkg.source, uvr_core::lockfile::PackageSource::Local { .. })
+}
+
+/// `--frozen` promises a reproducible install; a path package breaks that
+/// promise, so say which ones do.
+fn local_packages_warning(lockfile: &Lockfile) -> Option<String> {
+    let names: Vec<&str> = lockfile
+        .packages
+        .iter()
+        .filter(|p| is_local(p))
+        .map(|p| p.name.as_str())
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "uvr.lock contains local path dependencies ({}); it is not reproducible across \
+             machines — each directory must exist at the same place, and its contents are \
+             not recorded in the lockfile",
+            names.join(", ")
+        )
+    })
+}
+
 fn is_installed(pkg: &LockedPackage, library: &std::path::Path) -> bool {
+    // ponytail: a path package is rebuilt on every install, because edits to
+    // its directory change neither the lock nor its version. Rebuilds reuse
+    // the `src/*.o` files R CMD INSTALL leaves in the directory. If that is
+    // still too slow, record a directory fingerprint (newest mtime, walked
+    // with the `ignore` crate) next to the installed package and compare it.
+    if is_local(pkg) {
+        return false;
+    }
     let Ok(nested) = NestedProvenance::from_locked(pkg) else {
         return false;
     };
@@ -1654,15 +1734,16 @@ fn is_installed(pkg: &LockedPackage, library: &std::path::Path) -> bool {
         return false;
     };
     let fields = uvr_core::dcf::parse_dcf_fields(&content);
-    match fields.get("Version") {
-        Some(v) => {
-            let installed = v.trim();
-            installed == pkg.version
-                || uvr_core::resolver::normalize_version(installed) == pkg.version
-                || pkg.raw_version.as_deref() == Some(installed)
-        }
-        None => false,
-    }
+    fields
+        .get("Version")
+        .is_some_and(|v| version_matches(v.trim(), pkg))
+}
+
+/// Whether an installed DESCRIPTION `Version:` is the locked version.
+fn version_matches(installed: &str, pkg: &LockedPackage) -> bool {
+    installed == pkg.version
+        || uvr_core::resolver::normalize_version(installed) == pkg.version
+        || pkg.raw_version.as_deref() == Some(installed)
 }
 
 /// Read the installed version of a package from its DESCRIPTION, or None if not installed.
@@ -2201,16 +2282,17 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
                 pkg.name, ver
             )
         }
-        // Forgejo, GitLab, GitHub, and Local always have `url` populated by
-        // the resolver (or are file:// paths handled elsewhere); the
-        // `if let Some(url) ...` guard at the top of this function takes
-        // the URL straight from `pkg.url`. If we reach this arm with no
-        // URL, something earlier mis-resolved; return empty and let the
-        // sync surface a clear download error.
-        PackageSource::Forgejo { .. }
-        | PackageSource::Gitlab { .. }
-        | PackageSource::GitHub
-        | PackageSource::Local => String::new(),
+        // A path package has no URL: its "URL" is the directory, relative to
+        // the project root (the install step resolves it).
+        PackageSource::Local { ref path } => path.clone(),
+        // Forgejo, GitLab, and GitHub always have `url` populated by the
+        // resolver; the `if let Some(url) ...` guard at the top of this
+        // function takes the URL straight from `pkg.url`. If we reach this
+        // arm with no URL, something earlier mis-resolved; return empty and
+        // let the sync surface a clear download error.
+        PackageSource::Forgejo { .. } | PackageSource::Gitlab { .. } | PackageSource::GitHub => {
+            String::new()
+        }
         PackageSource::Custom { .. } => {
             // Custom repo packages should always have a stored URL from resolution.
             // Fall back to empty if somehow missing.
@@ -2903,6 +2985,53 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(!plan.is_binary);
         assert_eq!(Some(plan.url.as_str()), pkg.url.as_deref());
         assert!(plan.fallback_url.is_none());
+    }
+
+    fn local_locked(name: &str, path: &str) -> LockedPackage {
+        LockedPackage {
+            source: PackageSource::Local { path: path.into() },
+            url: None,
+            ..locked_pkg(name, "1.1.6", "")
+        }
+    }
+
+    #[test]
+    fn select_plan_never_swaps_a_path_package_for_a_binary() {
+        // The musl registry has an `rlang` 1.1.6 binary; a path package of the
+        // same name and version must still build from its own directory.
+        let pkg = local_locked("rlang", "../rlang");
+        let reg = CranRegistry::for_test(
+            parse_packages_gz(rlang_musl_packages()).unwrap(),
+            "https://rpkgs.example.com/src/contrib".into(),
+        );
+        let plan = select_pkg_plan(&pkg, &[&reg], None, &musl_host(), "4.5", None);
+        assert!(!plan.is_binary);
+        assert_eq!(plan.url, "../rlang");
+        assert!(plan.fallback_url.is_none());
+    }
+
+    #[test]
+    fn path_packages_are_always_reinstalled() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_installed_pkg(tmp.path(), "mypkg", "1.1.6");
+        assert!(is_installed(&locked_pkg("mypkg", "1.1.6", ""), tmp.path()));
+        assert!(!is_installed(
+            &local_locked("mypkg", "../mypkg"),
+            tmp.path()
+        ));
+    }
+
+    #[test]
+    fn frozen_warning_names_only_path_packages() {
+        let mut lockfile = lockfile_with(&["cli", "rlang"]);
+        assert_eq!(local_packages_warning(&lockfile), None);
+        lockfile.packages.push(local_locked("mypkg", "../mypkg"));
+        let warning = local_packages_warning(&lockfile).unwrap();
+        assert!(warning.contains("(mypkg)"), "{warning}");
+        assert!(
+            warning.contains("not reproducible across machines"),
+            "{warning}"
+        );
     }
 
     #[test]

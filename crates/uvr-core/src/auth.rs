@@ -3,27 +3,35 @@
 //! A `[[sources]]` entry names a repository; its secret comes from the
 //! environment, keyed by that name, or from `~/.netrc`, keyed by host
 //! (#186), and never from `uvr.toml`. This is the single credential
-//! resolver; the git-host tokens (#187) are meant to move behind it too.
+//! resolver: the git hosts (GitHub, GitLab, Forgejo) get their tokens from
+//! [`GitHost`] here too (#187).
 
 use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use reqwest::StatusCode;
+use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::{RequestBuilder, Response, StatusCode};
 
 use crate::error::UvrError;
+use crate::lockfile::PackageSource;
 
 const TOKEN_PREFIX: &str = "UVR_REPO_TOKEN_";
 const USER_PREFIX: &str = "UVR_REPO_USER_";
 const PASSWORD_PREFIX: &str = "UVR_REPO_PASSWORD_";
 
-/// A credential for one repository. `Debug` prints `Bearer ***` /
-/// `Basic ***`, never the secret.
+/// A credential for one repository or git host. `Debug` prints
+/// `Bearer ***` / `Basic ***` / `Token ***`, never the secret.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Credential {
     Bearer(String),
-    Basic { username: String, password: String },
+    Basic {
+        username: String,
+        password: String,
+    },
+    /// `Authorization: token <t>`, the scheme that Forgejo documents.
+    Token(String),
 }
 
 impl fmt::Debug for Credential {
@@ -31,6 +39,7 @@ impl fmt::Debug for Credential {
         f.write_str(match self {
             Credential::Bearer(_) => "Bearer ***",
             Credential::Basic { .. } => "Basic ***",
+            Credential::Token(_) => "Token ***",
         })
     }
 }
@@ -42,6 +51,18 @@ impl Credential {
         match self {
             Credential::Bearer(token) => req.bearer_auth(token),
             Credential::Basic { username, password } => req.basic_auth(username, Some(password)),
+            Credential::Token(token) => {
+                let value = format!("token {token}");
+                match HeaderValue::from_str(&value) {
+                    Ok(mut value) => {
+                        value.set_sensitive(true);
+                        req.header(AUTHORIZATION, value)
+                    }
+                    // Not a valid header value: reqwest reports that on
+                    // send, as it does for bearer_auth.
+                    Err(_) => req.header(AUTHORIZATION, value),
+                }
+            }
         }
     }
 }
@@ -117,10 +138,289 @@ fn url_host(url: &str) -> Option<String> {
 /// The password of the netrc entry for git host `host` (no `:port`). The
 /// git hosts send it as their API token, in the header each one uses,
 /// because GitLab's API does not take basic auth. The login is not used.
-pub fn netrc_password(host: &str) -> Option<String> {
+fn netrc_password(host: &str) -> Option<String> {
     netrc_entry(host)
         .map(|entry| entry.password)
         .filter(|p| !p.is_empty())
+}
+
+/// The netrc file, for messages.
+fn netrc_display() -> String {
+    netrc_path().map_or_else(|| "~/.netrc".into(), |p| p.display().to_string())
+}
+
+/// The netrc entries, as (file, machine), that a git host refused in this
+/// run. uvr does not send them again.
+static REFUSED_NETRC: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+thread_local! {
+    /// Test servers that stand in for git hosts, as (host, origin). This is
+    /// never cleared: it relies on the test harness giving each test a new
+    /// thread, as libtest and nextest do.
+    static TEST_GIT_ORIGINS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The origin of each URL that uvr builds for git host `host`:
+/// `https://<host>`. In unit tests, a test server can take its place on
+/// the current thread (`test_git_origin`).
+pub(crate) fn git_origin(host: &str) -> String {
+    #[cfg(test)]
+    {
+        let test = TEST_GIT_ORIGINS.with_borrow(|origins| {
+            origins
+                .iter()
+                .find(|(h, _)| h == host)
+                .map(|(_, origin)| origin.clone())
+        });
+        if let Some(origin) = test {
+            return origin;
+        }
+    }
+    format!("https://{host}")
+}
+
+/// A git host that uvr fetches packages from (#187). This decides which
+/// token a host gets, in which header, and which URLs can receive it. The
+/// providers only build URLs and call [`GitHost::send`]. A GitLab or
+/// Forgejo host is `host[:port]`, so this works for any instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHost<'a> {
+    /// github.com, through `api.github.com` and `raw.githubusercontent.com`.
+    GitHub,
+    GitLab(&'a str),
+    Forgejo(&'a str),
+}
+
+impl<'a> GitHost<'a> {
+    /// The git host that a locked package comes from, if any.
+    pub fn for_source(source: &'a PackageSource) -> Option<Self> {
+        match source {
+            PackageSource::GitHub => Some(GitHost::GitHub),
+            PackageSource::Gitlab { host } => Some(GitHost::GitLab(host)),
+            PackageSource::Forgejo { host } => Some(GitHost::Forgejo(host)),
+            _ => None,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            GitHost::GitHub => "GitHub".into(),
+            GitHost::GitLab(host) => format!("GitLab host {host}"),
+            GitHost::Forgejo(host) => format!("Forgejo host {host}"),
+        }
+    }
+
+    /// The variables that hold this host's token, in order of precedence.
+    /// GitHub: `GITHUB_PAT` (the renv/devtools name), then `GITHUB_TOKEN`
+    /// (the CI name). A token also lifts GitHub's anonymous limit of 60
+    /// requests per hour (#95). GitLab and Forgejo: the variable for this
+    /// host, then the variable for all hosts. `<HOST>` is [`env_key`] of
+    /// the host (`git.local:3000` → `GIT_LOCAL`).
+    fn token_vars(&self) -> [String; 2] {
+        match self {
+            GitHost::GitHub => ["GITHUB_PAT".into(), "GITHUB_TOKEN".into()],
+            GitHost::GitLab(host) => [
+                format!("UVR_GITLAB_TOKEN_{}", env_key(host)),
+                "UVR_GITLAB_TOKEN".into(),
+            ],
+            GitHost::Forgejo(host) => [
+                format!("UVR_FORGEJO_TOKEN_{}", env_key(host)),
+                "UVR_FORGEJO_TOKEN".into(),
+            ],
+        }
+    }
+
+    /// The netrc `machine` of this host: the host name without a port.
+    /// GitHub uses `github.com`, the host that its dependencies name.
+    fn machine(&self) -> &'a str {
+        match self {
+            GitHost::GitHub => "github.com",
+            GitHost::GitLab(host) | GitHost::Forgejo(host) => {
+                host.split_once(':').map_or(host, |(h, _port)| h)
+            }
+        }
+    }
+
+    /// Whether `url` is on this host, so that the host's credential can go
+    /// to it: the same scheme, host and port as an origin that uvr builds
+    /// this host's URLs from. For GitHub, these are `api.github.com` and
+    /// `raw.githubusercontent.com` only. `codeload.github.com`, where
+    /// tarball requests redirect with their own token in the URL, is not
+    /// one of them.
+    pub fn serves(&self, url: &str) -> bool {
+        let Ok(url) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        let origins = match self {
+            GitHost::GitHub => vec![
+                git_origin("api.github.com"),
+                git_origin("raw.githubusercontent.com"),
+            ],
+            GitHost::GitLab(host) | GitHost::Forgejo(host) => vec![git_origin(host)],
+        };
+        origins
+            .iter()
+            .filter_map(|origin| reqwest::Url::parse(origin).ok())
+            .any(|origin| origin.origin() == url.origin())
+    }
+
+    /// The first token variable that is set, as (name, value).
+    fn env_token(&self) -> Option<(String, String)> {
+        self.token_vars().into_iter().find_map(|var| {
+            let token = crate::env_vars::read_env_var(&var)?.trim().to_string();
+            Some((var, token))
+        })
+    }
+
+    /// The credential for this host. The first match wins:
+    ///
+    /// 1. The token variables, in order (see `token_vars`).
+    /// 2. The password of the netrc entry for the host (#186), unless the
+    ///    host refused it earlier in this run. It must be an access token,
+    ///    because GitLab's API does not accept basic auth.
+    ///
+    /// Forgejo gets `Authorization: token …`. GitHub and GitLab get
+    /// `Bearer …`. Values are trimmed, and empty values count as unset.
+    pub fn credential(&self) -> Option<Credential> {
+        let token = match self.env_token() {
+            Some((_, token)) => token,
+            None if self.netrc_refused() => return None,
+            None => netrc_password(self.machine())?,
+        };
+        Some(match self {
+            GitHost::Forgejo(_) => Credential::Token(token),
+            GitHost::GitHub | GitHost::GitLab(_) => Credential::Bearer(token),
+        })
+    }
+
+    fn netrc_key(&self) -> Option<(PathBuf, String)> {
+        Some((netrc_path()?, self.machine().to_ascii_lowercase()))
+    }
+
+    fn netrc_refused(&self) -> bool {
+        self.netrc_key().is_some_and(|key| {
+            REFUSED_NETRC
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&key)
+        })
+    }
+
+    /// Stop using this host's netrc entry for the rest of the run. Returns
+    /// true only the first time.
+    fn refuse_netrc(&self) -> bool {
+        let Some(key) = self.netrc_key() else {
+            return false;
+        };
+        let mut refused = REFUSED_NETRC.lock().unwrap_or_else(PoisonError::into_inner);
+        if refused.contains(&key) {
+            return false;
+        }
+        refused.push(key);
+        true
+    }
+
+    /// Send `req`. If it goes to this host (see [`GitHost::serves`]), it
+    /// carries the host's credential instead of any `Authorization` that it
+    /// has. If not, uvr sends it unchanged. reqwest removes the header when
+    /// a redirect goes to a different host or port.
+    ///
+    /// Git and other tools also read netrc, so an entry can hold an account
+    /// password or an expired token. The host then refuses it, also for a
+    /// public repository, which uvr fetched without credentials before
+    /// #186. Thus, when a netrc credential gets a 401 (or a 404, which is
+    /// how raw.githubusercontent.com refuses), uvr sends the request again
+    /// without credentials. After a 401, or a 404 that the retry turns into
+    /// a success, uvr shows one warning and stops using the entry for this
+    /// run. If the retry also fails, the result is the first response, so
+    /// that a 401 error is about the credential. uvr never drops a token
+    /// from a variable like this.
+    pub async fn send(&self, req: RequestBuilder) -> reqwest::Result<Response> {
+        let (client, request) = req.build_split();
+        let mut request = request?;
+        let credential = if self.serves(request.url().as_str()) {
+            self.credential()
+        } else {
+            None
+        };
+        let Some(credential) = credential else {
+            return client.execute(request).await;
+        };
+        request.headers_mut().remove(AUTHORIZATION);
+        let anonymous = request.try_clone();
+        let resp = credential
+            .apply(RequestBuilder::from_parts(client.clone(), request))
+            .send()
+            .await?;
+        let status = resp.status();
+        let maybe_refused = status == StatusCode::UNAUTHORIZED || status == StatusCode::NOT_FOUND;
+        if !maybe_refused || self.env_token().is_some() {
+            return Ok(resp);
+        }
+        let Some(anonymous) = anonymous else {
+            return Ok(resp);
+        };
+        let retry = client.execute(anonymous).await?;
+        // raw.githubusercontent.com answers a refused token with 404, not
+        // 401. A 404 counts as a refusal only if the retry then succeeds,
+        // because a 404 can also be a file that is not there.
+        let refused = status == StatusCode::UNAUTHORIZED || retry.status().is_success();
+        if refused && self.refuse_netrc() {
+            tracing::warn!(
+                "{} refused the password of the `machine {}` entry in {} (HTTP {status}). \
+                 uvr continues without it. Put a valid access token in the entry, or set {}.",
+                self.label(),
+                self.machine(),
+                netrc_display(),
+                self.token_vars()[0]
+            );
+        }
+        Ok(if retry.status().is_success() {
+            retry
+        } else {
+            resp
+        })
+    }
+
+    /// What to do about a 401 or 403 from this host. The text never
+    /// contains the credential.
+    pub fn denied_advice(&self) -> String {
+        let [first, second] = self.token_vars();
+        let machine = self.machine();
+        let netrc = netrc_display();
+        if let Some((var, _)) = self.env_token() {
+            return format!(
+                "it refused the token in {var}. Check that the token is valid and can read \
+                 this repository."
+            );
+        }
+        if netrc_password(machine).is_some() {
+            return format!(
+                "it refused the password of the `machine {machine}` entry in {netrc}. Check \
+                 that it is a valid access token, or set {first}, which has precedence."
+            );
+        }
+        format!(
+            "if the repository is private, set {first} (or {second}) to an access token, or \
+             add a `machine {machine}` entry with the token as its password to {netrc}."
+        )
+    }
+
+    /// The error for a 401 or 403 from this host at `url`, or `None` for
+    /// any other status.
+    pub fn denied_error(&self, status: StatusCode, url: &str) -> Option<UvrError> {
+        if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+            return None;
+        }
+        Some(UvrError::Other(format!(
+            "{} returned HTTP {status} for {}: {}",
+            self.label(),
+            redact_url(url),
+            self.denied_advice()
+        )))
+    }
 }
 
 /// One `machine` entry of a netrc file. No `Debug`: it holds a password.
@@ -355,7 +655,7 @@ impl Repository {
             redact_url(&self.url)
         );
         let host = url_host(&self.url).unwrap_or_default();
-        let netrc = netrc_path().map_or_else(|| "~/.netrc".into(), |p| p.display().to_string());
+        let netrc = netrc_display();
         let advice = match &self.credential {
             None if has_userinfo(&self.url) => format!(
                 "it refused the credentials in the repository URL. Check them, or remove them \
@@ -379,6 +679,8 @@ impl Repository {
                 "it refused the credentials in UVR_REPO_USER_{key} / UVR_REPO_PASSWORD_{key}. \
                  Check that they are valid and give access to this repository."
             ),
+            // resolve() never gives this scheme to a repository.
+            Some(Credential::Token(_)) => "it refused the token.".into(),
         };
         Some(UvrError::Other(format!("{head}: {advice}")))
     }
@@ -459,6 +761,74 @@ pub(crate) fn test_response(status: &str, headers: &str, body: &[u8]) -> Vec<u8>
     .into_bytes();
     out.extend_from_slice(body);
     out
+}
+
+/// Let `origin` (a [`test_server`]) take the place of git host `host` on
+/// this thread. A current-thread tokio runtime runs its tasks there too.
+#[cfg(all(test, not(target_os = "windows")))]
+pub(crate) fn test_git_origin(host: &str, origin: &str) {
+    TEST_GIT_ORIGINS.with_borrow_mut(|origins| origins.push((host.into(), origin.into())));
+}
+
+/// A git host with one private repository, as GitHub, GitLab and Forgejo
+/// behave: a request with `Authorization: <auth>` gets `route(path)`,
+/// another credential gets 401, and no credential gets 404.
+#[cfg(all(test, not(target_os = "windows")))]
+pub(crate) fn test_private_git_host(
+    auth: &'static str,
+    route: impl Fn(&str) -> Vec<u8> + Send + 'static,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    test_server(move |head| match test_authorization(head) {
+        Some(sent) if sent == auth => route(test_path(head)),
+        Some(_) => test_response("401 Unauthorized", "", b""),
+        None => test_response("404 Not Found", "", b""),
+    })
+}
+
+/// The path and query of a request head.
+#[cfg(all(test, not(target_os = "windows")))]
+pub(crate) fn test_path(head: &str) -> &str {
+    head.split_whitespace().nth(1).unwrap_or_default()
+}
+
+/// Every variable that the git-host tests set: cleared on creation (with
+/// `GITHUB_PAT`, `GITHUB_TOKEN` and `NETRC`), and restored on drop. It
+/// holds the env lock, and points `NETRC` at a missing file so that the
+/// developer's own `~/.netrc` cannot change a result.
+#[cfg(test)]
+pub(crate) struct GitEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl GitEnv {
+    pub(crate) fn new(vars: &[&'static str]) -> Self {
+        let lock = crate::env_vars::env_lock();
+        let saved = vars
+            .iter()
+            .chain(&["GITHUB_PAT", "GITHUB_TOKEN", "NETRC"])
+            .map(|var| (*var, std::env::var_os(var)))
+            .collect();
+        let env = GitEnv { saved, _lock: lock };
+        for (var, _) in &env.saved {
+            std::env::remove_var(var);
+        }
+        std::env::set_var("NETRC", "/nonexistent/uvr-test-netrc");
+        env
+    }
+}
+
+#[cfg(test)]
+impl Drop for GitEnv {
+    fn drop(&mut self) {
+        for (var, value) in &self.saved {
+            match value {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+    }
 }
 
 /// The `Authorization` header of a request head, if any.
@@ -810,24 +1180,104 @@ mod tests {
         std::env::remove_var("NETRC");
     }
 
+    /// The token that `host` gets, without its header scheme.
+    fn token(host: GitHost) -> Option<String> {
+        host.credential().map(|credential| match credential {
+            Credential::Bearer(token) | Credential::Token(token) => token,
+            Credential::Basic { .. } => panic!("git hosts get no basic auth"),
+        })
+    }
+
+    // The variables and the precedence that each host had before #187
+    // (github_token, gitlab_token and forgejo_token), and #186's netrc
+    // fallback: no user has to change their setup.
+    #[test]
+    fn git_hosts_keep_their_token_variables() {
+        let _env = GitEnv::new(&[
+            "UVR_FORGEJO_TOKEN",
+            "UVR_FORGEJO_TOKEN_LOOKUP_TEST_HOST_EXAMPLE",
+            "UVR_FORGEJO_TOKEN_GIT_LOCAL",
+            "UVR_GITLAB_TOKEN",
+            "UVR_GITLAB_TOKEN_LOOKUP_TEST_HOST_EXAMPLE",
+            "UVR_GITLAB_TOKEN_GIT_LOCAL",
+        ]);
+        let host = "lookup-test-host.example";
+        for (kind, forgejo) in [
+            (GitHost::Forgejo(host), true),
+            (GitHost::GitLab(host), false),
+        ] {
+            let (per_host, global) = if forgejo {
+                (
+                    "UVR_FORGEJO_TOKEN_LOOKUP_TEST_HOST_EXAMPLE",
+                    "UVR_FORGEJO_TOKEN",
+                )
+            } else {
+                (
+                    "UVR_GITLAB_TOKEN_LOOKUP_TEST_HOST_EXAMPLE",
+                    "UVR_GITLAB_TOKEN",
+                )
+            };
+            // The per-host variable beats the global one.
+            std::env::set_var(per_host, "host-specific");
+            std::env::set_var(global, "global");
+            assert_eq!(token(kind).as_deref(), Some("host-specific"));
+            std::env::remove_var(per_host);
+            assert_eq!(token(kind).as_deref(), Some("global"));
+            std::env::remove_var(global);
+            assert_eq!(token(kind), None);
+            // Whitespace-only values count as unset; values are trimmed.
+            std::env::set_var(global, "   ");
+            assert_eq!(token(kind), None);
+            std::env::set_var(global, " tok\n");
+            assert_eq!(token(kind).as_deref(), Some("tok"));
+            std::env::remove_var(global);
+        }
+        // A port is not part of the variable name.
+        std::env::set_var("UVR_FORGEJO_TOKEN_GIT_LOCAL", "f");
+        std::env::set_var("UVR_GITLAB_TOKEN_GIT_LOCAL", "g");
+        assert_eq!(
+            token(GitHost::Forgejo("git.local:3000")).as_deref(),
+            Some("f")
+        );
+        assert_eq!(
+            token(GitHost::GitLab("git.local:3000")).as_deref(),
+            Some("g")
+        );
+        // Each host reads only its own variables.
+        assert_eq!(token(GitHost::GitHub), None);
+        assert_eq!(token(GitHost::Forgejo("other.local")), None);
+
+        // GitHub: GITHUB_PAT, then GITHUB_TOKEN.
+        std::env::set_var("GITHUB_TOKEN", "ci");
+        assert_eq!(token(GitHost::GitHub).as_deref(), Some("ci"));
+        std::env::set_var("GITHUB_PAT", "pat");
+        assert_eq!(token(GitHost::GitHub).as_deref(), Some("pat"));
+        std::env::set_var("GITHUB_PAT", " ");
+        assert_eq!(token(GitHost::GitHub).as_deref(), Some("ci"));
+
+        // Header schemes: Forgejo `token`, GitHub and GitLab `Bearer`.
+        assert_eq!(
+            GitHost::Forgejo("git.local").credential(),
+            Some(Credential::Token("f".into()))
+        );
+        assert_eq!(
+            GitHost::GitLab("git.local").credential(),
+            Some(Credential::Bearer("g".into()))
+        );
+        assert_eq!(
+            GitHost::GitHub.credential(),
+            Some(Credential::Bearer("ci".into()))
+        );
+    }
+
     #[test]
     fn git_host_tokens_fall_back_to_netrc() {
-        use crate::registry::{forgejo::forgejo_token, github::github_token, gitlab::gitlab_token};
-
-        let _env = crate::env_vars::env_lock();
-        let vars = [
-            "GITHUB_PAT",
-            "GITHUB_TOKEN",
+        let _env = GitEnv::new(&[
             "UVR_FORGEJO_TOKEN",
             "UVR_FORGEJO_TOKEN_GIT_LOCAL",
             "UVR_GITLAB_TOKEN",
             "UVR_GITLAB_TOKEN_GIT_LOCAL",
-            "NETRC",
-        ];
-        let saved: Vec<_> = vars.iter().map(std::env::var_os).collect();
-        for var in vars {
-            std::env::remove_var(var);
-        }
+        ]);
         let dir = tempfile::tempdir().unwrap();
         let netrc = write_netrc(
             dir.path(),
@@ -841,28 +1291,156 @@ mod tests {
 
         // The password is the token; a port is not part of the netrc key.
         assert_eq!(
-            forgejo_token("git.local:3000").as_deref(),
+            token(GitHost::Forgejo("git.local:3000")).as_deref(),
             Some("pat-local")
         );
-        assert_eq!(gitlab_token("git.local").as_deref(), Some("pat-local"));
-        assert_eq!(github_token().as_deref(), Some("pat-github"));
-        assert_eq!(forgejo_token("other.local"), None);
-        assert_eq!(gitlab_token("nopass.local"), None);
+        assert_eq!(
+            token(GitHost::GitLab("git.local")).as_deref(),
+            Some("pat-local")
+        );
+        assert_eq!(token(GitHost::GitHub).as_deref(), Some("pat-github"));
+        assert_eq!(token(GitHost::Forgejo("other.local")), None);
+        assert_eq!(token(GitHost::GitLab("nopass.local")), None);
 
         // An env token, per host or global, beats netrc.
         std::env::set_var("UVR_FORGEJO_TOKEN", "env-forgejo");
         std::env::set_var("UVR_GITLAB_TOKEN_GIT_LOCAL", "env-gitlab");
         std::env::set_var("GITHUB_TOKEN", "env-github");
-        assert_eq!(forgejo_token("git.local").as_deref(), Some("env-forgejo"));
-        assert_eq!(gitlab_token("git.local").as_deref(), Some("env-gitlab"));
-        assert_eq!(github_token().as_deref(), Some("env-github"));
+        assert_eq!(
+            token(GitHost::Forgejo("git.local")).as_deref(),
+            Some("env-forgejo")
+        );
+        assert_eq!(
+            token(GitHost::GitLab("git.local")).as_deref(),
+            Some("env-gitlab")
+        );
+        assert_eq!(token(GitHost::GitHub).as_deref(), Some("env-github"));
+    }
 
-        for (var, value) in vars.iter().zip(saved) {
-            match value {
-                Some(v) => std::env::set_var(var, v),
-                None => std::env::remove_var(var),
-            }
+    // A git host's credential goes to its own origins only (#187).
+    #[test]
+    fn git_host_credential_stays_on_its_host() {
+        let github = GitHost::GitHub;
+        for url in [
+            "https://api.github.com/repos/o/r/tarball/abc",
+            "https://raw.githubusercontent.com/o/r/abc/DESCRIPTION",
+            "https://API.GitHub.com:443/repos/o/r/commits/main",
+        ] {
+            assert!(github.serves(url), "{url}");
         }
+        for url in [
+            // Where the tarball endpoint redirects: its URL has its own token.
+            "https://codeload.github.com/o/r/legacy.tar.gz/abc?token=x",
+            "https://github.com/o/r",
+            "https://gitlab.com/api/v4/projects/1",
+            "https://packagemanager.posit.co/cran/latest/bin/a.tgz",
+            "http://api.github.com/repos/o/r/tarball/abc",
+            "https://api.github.com:8443/repos/o/r/tarball/abc",
+            "https://api.github.com.evil.example/repos/o/r",
+            "https://api.github.com@evil.example/repos/o/r",
+            "https://evil.example/api.github.com/repos/o/r",
+            "not a url",
+        ] {
+            assert!(!github.serves(url), "{url}");
+        }
+
+        let forgejo = GitHost::Forgejo("git.local:3000");
+        assert!(forgejo.serves("https://git.local:3000/api/v1/repos/o/r/archive/a.tar.gz"));
+        assert!(forgejo.serves("https://GIT.LOCAL:3000/api/v1/x"));
+        assert!(!forgejo.serves("https://git.local/api/v1/x"));
+        assert!(!forgejo.serves("https://git.local:3001/api/v1/x"));
+        assert!(!forgejo.serves("http://git.local:3000/api/v1/x"));
+        assert!(!forgejo.serves("https://api.github.com/repos/o/r/tarball/abc"));
+
+        let gitlab = GitHost::GitLab("gitlab.com");
+        assert!(gitlab.serves("https://gitlab.com:443/api/v4/projects/1"));
+        assert!(!gitlab.serves("https://gitlab.com:8443/api/v4/projects/1"));
+        assert!(!gitlab.serves("https://codefloe.com/api/v1/repos/o/r"));
+        assert!(!GitHost::Forgejo("codefloe.com").serves("https://gitlab.com/api/v4/x"));
+
+        assert_eq!(
+            GitHost::for_source(&PackageSource::Forgejo {
+                host: "git.local:3000".into()
+            }),
+            Some(forgejo)
+        );
+        assert_eq!(
+            GitHost::for_source(&PackageSource::Gitlab {
+                host: "gitlab.com".into()
+            }),
+            Some(gitlab)
+        );
+        assert_eq!(GitHost::for_source(&PackageSource::GitHub), Some(github));
+        assert_eq!(GitHost::for_source(&PackageSource::Cran), None);
+    }
+
+    #[test]
+    fn token_header_is_forgejo_scheme_and_sensitive() {
+        let request = Credential::Token("tok123".into())
+            .apply(reqwest::Client::new().get("https://git.local/"))
+            .build()
+            .unwrap();
+        let value = &request.headers()[AUTHORIZATION];
+        assert_eq!(value, "token tok123");
+        assert!(value.is_sensitive());
+        assert_eq!(
+            format!("{:?}", Credential::Token("tok123".into())),
+            "Token ***"
+        );
+        // An invalid value fails the request, as bearer_auth does.
+        assert!(Credential::Token("a\nb".into())
+            .apply(reqwest::Client::new().get("https://git.local/"))
+            .build()
+            .is_err());
+    }
+
+    #[test]
+    fn git_host_refusal_says_how_to_authenticate() {
+        let _env = GitEnv::new(&["UVR_FORGEJO_TOKEN_GIT_LOCAL", "UVR_FORGEJO_TOKEN"]);
+        let host = GitHost::Forgejo("git.local:3000");
+        let url = "https://git.local:3000/api/v1/repos/o/r/archive/a.tar.gz";
+        assert!(host.denied_error(StatusCode::NOT_FOUND, url).is_none());
+
+        let msg = host
+            .denied_error(StatusCode::UNAUTHORIZED, url)
+            .unwrap()
+            .to_string();
+        assert!(msg.contains("Forgejo host git.local:3000"), "{msg}");
+        assert!(
+            msg.contains("set UVR_FORGEJO_TOKEN_GIT_LOCAL (or UVR_FORGEJO_TOKEN)"),
+            "{msg}"
+        );
+        assert!(msg.contains("`machine git.local` entry"), "{msg}");
+        assert!(!msg.contains("UVR_REPO_"), "{msg}");
+
+        std::env::set_var("UVR_FORGEJO_TOKEN", "s3cret-tok");
+        let msg = host
+            .denied_error(StatusCode::FORBIDDEN, url)
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains("refused the token in UVR_FORGEJO_TOKEN."),
+            "{msg}"
+        );
+        assert!(!msg.contains("s3cret-tok"), "{msg}");
+        std::env::remove_var("UVR_FORGEJO_TOKEN");
+
+        let dir = tempfile::tempdir().unwrap();
+        let netrc = write_netrc(
+            dir.path(),
+            "netrc",
+            "machine github.com password n3trc-tok\n",
+            0o600,
+        );
+        std::env::set_var("NETRC", &netrc);
+        let msg = GitHost::GitHub.denied_advice();
+        assert!(
+            msg.contains("refused the password of the `machine github.com` entry in")
+                && msg.contains(&netrc.display().to_string())
+                && msg.contains("set GITHUB_PAT, which has precedence"),
+            "{msg}"
+        );
+        assert!(!msg.contains("n3trc-tok"), "{msg}");
     }
 
     #[cfg(unix)]

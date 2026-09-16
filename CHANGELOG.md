@@ -7,6 +7,16 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **One credential path for GitHub, GitLab and Forgejo** (#187). The three
+  git hosts now get their tokens from the same resolver as `[[sources]]`
+  repositories, with the same variables and order as before. Private GitHub
+  dependencies now install: uvr also sends the token with the tarball
+  download, not only at lock time. A git host's token now goes only to URLs
+  on that host. Before, `uvr sync` could send a GitLab or Forgejo token to a
+  P3M or custom-source binary URL for a package with the same name. If a
+  host refuses a `~/.netrc` password, uvr shows a warning and continues
+  without credentials, so an old entry does not break public repositories.
+
 - **Credentials from `~/.netrc`** (#186). If no `UVR_REPO_*` variable is set
   for a `[[sources]]` repository, uvr uses the `~/.netrc` entry for its host
   (HTTP basic auth). GitHub, GitLab and Forgejo dependencies also use the

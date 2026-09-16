@@ -483,6 +483,7 @@ async fn probe_bioc(project: &Project, name: &str) -> Option<bool> {
 /// user knows manifest names may need a manual touch-up. A `subdirectory`
 /// spec is the exception: a failed lookup errors instead.
 async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Result<()> {
+    use uvr_core::auth::GitHost;
     use uvr_core::registry::github::parse_github_spec;
 
     let needs_resolve: Vec<usize> = parsed
@@ -525,9 +526,9 @@ async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Resul
         let git_ref_owned = d.rev.as_deref().unwrap_or("HEAD").to_string();
         let subdirectory = d.subdirectory.clone();
 
-        // Build the raw-DESCRIPTION URL appropriate for the registry, and
-        // attach an appropriate token if one is in the environment.
-        let (desc_url, auth_header) = if let Some(body) = git.strip_prefix("forgejo::") {
+        // Build the raw-DESCRIPTION URL appropriate for the registry. The
+        // host's token, if any, goes with it (#187).
+        let (desc_url, host) = if let Some(body) = git.strip_prefix("forgejo::") {
             let parts: Vec<&str> = body.split('/').collect();
             if parts.len() != 3 || parts.iter().any(|s| s.is_empty()) {
                 continue;
@@ -539,9 +540,7 @@ async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Resul
                 repo = parts[2],
                 r = git_ref_owned,
             );
-            let auth =
-                uvr_core::registry::forgejo::forgejo_token(host).map(|t| format!("token {t}"));
-            (url, auth)
+            (url, GitHost::Forgejo(host))
         } else if let Some(body) = git.strip_prefix("gitlab::") {
             let parts: Vec<&str> = body.split('/').collect();
             if parts.len() < 3 || parts.iter().any(|s| s.is_empty()) {
@@ -553,9 +552,7 @@ async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Resul
                 "https://{host}/api/v4/projects/{project_id}/repository/files/DESCRIPTION/raw?ref={r}",
                 r = git_ref_owned,
             );
-            let auth =
-                uvr_core::registry::gitlab::gitlab_token(host).map(|t| format!("Bearer {t}"));
-            (url, auth)
+            (url, GitHost::GitLab(host))
         } else {
             // github: `user/repo`
             let spec_str = format!("{git}@{git_ref_owned}");
@@ -571,21 +568,16 @@ async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Resul
                     "https://raw.githubusercontent.com/{user}/{repo}/{resolved_ref}/DESCRIPTION"
                 ),
             };
-            // #95: attach a GitHub token when available so CI runners
-            // walking renv.lock imports don't hit the 60 req/hr shared
-            // unauthenticated rate limit.
-            let auth = uvr_core::registry::github::github_token().map(|t| format!("Bearer {t}"));
-            (url, auth)
+            // #95: a GitHub token also keeps CI runners that walk renv.lock
+            // imports under the 60 req/hr shared unauthenticated rate limit.
+            (url, GitHost::GitHub)
         };
 
-        let mut req = client
+        let req = client
             .get(&desc_url)
             .header("User-Agent", concat!("uvr/", env!("CARGO_PKG_VERSION")));
-        if let Some(auth) = auth_header {
-            req = req.header("Authorization", auth);
-        }
 
-        match req.send().await.and_then(|r| r.error_for_status()) {
+        match host.send(req).await.and_then(|r| r.error_for_status()) {
             Ok(resp) => {
                 let text = resp.text().await.unwrap_or_default();
                 let fields = uvr_core::dcf::parse_dcf_fields(&text);

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing::debug;
 
-use crate::auth::{self, Repository};
+use crate::auth::{self, GitHost, Repository};
 use crate::checksum;
 use crate::error::{Result, UvrError};
 use crate::lockfile::LockedPackage;
@@ -62,7 +62,9 @@ impl Downloader {
                 let fallback_url = spec.fallback_url.map(str::to_string);
                 let is_binary = spec.is_binary;
                 let user_agent = spec.user_agent.map(str::to_string);
-                let auth_header = spec.auth_header.map(str::to_string);
+                // A GitHub/GitLab/Forgejo package: its host's token goes to
+                // the URLs on that host (#187), whichever of them this is.
+                let source = spec.pkg.source.clone();
                 // Binary packages: lockfile checksum is for the source tarball, not the
                 // P3M binary. Skip verification on binary downloads, but keep the
                 // checksum for the fallback path which downloads the source tarball.
@@ -75,6 +77,7 @@ impl Downloader {
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
+                    let git = GitHost::for_source(&source);
 
                     // Try primary URL. The UA override only applies to the
                     // primary path — fallbacks (CRAN source) don't need it.
@@ -86,7 +89,7 @@ impl Downloader {
                         &url,
                         primary_checksum.as_deref(),
                         user_agent.as_deref(),
-                        auth_header.as_deref(),
+                        git,
                         &repos,
                         &mp,
                     )
@@ -119,7 +122,7 @@ impl Downloader {
                                 fallback,
                                 source_checksum.as_deref(),
                                 None, // fallback URL is plain CRAN source — no UA override needed
-                                None, // fallback is a different host; never forward primary auth
+                                git,
                                 &repos,
                                 &mp,
                             )
@@ -155,12 +158,40 @@ pub struct DownloadSpec<'a> {
     /// served at the same URL, and the default `uvr/x.y.z` UA gets you
     /// source. None = use the client's default UA.
     pub user_agent: Option<&'a str>,
-    /// Optional `Authorization` header value (e.g. `"token <forgejo>"` or
-    /// `"Bearer <github/gitlab>"`). Forwarded to the primary URL only.
-    /// Fallback URLs (CRAN Archive, P3M → source) deliberately drop the
-    /// header — the token is registry-scoped and shouldn't leak to other
-    /// hosts.
-    pub auth_header: Option<&'a str>,
+}
+
+/// Download the tarball of resolved git package `info` as `uvr sync` does,
+/// and return its bytes.
+#[cfg(all(test, not(target_os = "windows")))]
+pub(crate) fn test_download(
+    rt: &tokio::runtime::Runtime,
+    info: &crate::registry::PackageInfo,
+) -> Result<Vec<u8>> {
+    let pkg = LockedPackage {
+        name: info.name.clone(),
+        version: info.version.to_string(),
+        raw_version: None,
+        source: info.source.clone(),
+        url: Some(info.url.clone()),
+        checksum: info.checksum.clone(),
+        subdirectory: None,
+        requires: vec![],
+        system_requirements: None,
+        dev: false,
+    };
+    let cache = tempfile::tempdir()?;
+    let results = rt.block_on(
+        Downloader::new(reqwest::Client::new(), cache.path().to_path_buf(), 1).download_all(&[
+            DownloadSpec {
+                pkg: &pkg,
+                url: &info.url,
+                fallback_url: None,
+                is_binary: false,
+                user_agent: None,
+            },
+        ]),
+    )?;
+    Ok(std::fs::read(&results[0].path)?)
 }
 
 /// Result of downloading a single package.
@@ -241,7 +272,7 @@ async fn download_one(
     url: &str,
     expected_checksum: Option<&str>,
     user_agent: Option<&str>,
-    auth_header: Option<&str>,
+    git: Option<GitHost<'_>>,
     repos: &[Repository],
     mp: &MultiProgress,
 ) -> Result<PathBuf> {
@@ -317,31 +348,39 @@ async fn download_one(
 
     // Stream response to a temp file to avoid buffering entire packages in RAM.
     // Compute checksums on-the-fly during the stream.
-    // A repository credential goes only to URLs that repository serves.
-    let request = |target: &str, auth: Option<&str>| {
+    // A repository credential goes only to URLs that repository serves,
+    // and a git host's token only to URLs on that host, which it replaces
+    // the repository credential for.
+    let send = |target: &str| {
         let mut req = client.get(target);
         if let Some(ua) = user_agent {
             req = req.header(reqwest::header::USER_AGENT, ua);
         }
         let credential = auth::repository_for(repos, target).and_then(|r| r.credential.as_ref());
-        if let Some(auth) = auth {
-            req = req.header(reqwest::header::AUTHORIZATION, auth);
-        } else if let Some(credential) = credential {
+        if let Some(credential) = credential {
             req = credential.apply(req);
         }
-        req
+        async move {
+            match git {
+                Some(git) => git.send(req).await,
+                None => req.send().await,
+            }
+        }
     };
-    let mut resp_result = match request(url, auth_header).send().await {
+    let mut resp_result = match send(url).await {
         Ok(r) => r.error_for_status(),
         Err(e) => Err(e),
     };
-    // A 401/403 from a known repository is the error to report, even if
-    // the Archive retry below fails for some other reason.
+    // A 401/403 from a git host or a known repository is the error to
+    // report, even if the Archive retry below fails for some other reason.
     let denied = resp_result
         .as_ref()
         .err()
         .and_then(reqwest::Error::status)
-        .and_then(|status| auth::repository_for(repos, url)?.denied_error(status));
+        .and_then(|status| match git.filter(|git| git.serves(url)) {
+            Some(git) => git.denied_error(status, url),
+            None => auth::repository_for(repos, url)?.denied_error(status),
+        });
     if resp_result.is_err() {
         if let Some(archive_url) = cran_archive_url(url) {
             debug!(
@@ -350,10 +389,10 @@ async fn download_one(
                 auth::redact_url(&archive_url)
             );
             // CRAN Archive doesn't require the R-shaped UA, but plumbing the
-            // override here is harmless and keeps requests symmetric. Pass None
-            // for auth: a host-scoped token (e.g. Forgejo) must never leak onto
-            // the CRAN Archive URL, matching download_all's fallback (#105).
-            resp_result = match request(&archive_url, None).send().await {
+            // override here is harmless and keeps requests symmetric. A git
+            // host's token reaches the Archive URL only if it is on that
+            // host (#105, #187).
+            resp_result = match send(&archive_url).await {
                 Ok(r) => r.error_for_status(),
                 Err(e) => Err(e),
             };
@@ -792,7 +831,6 @@ mod tests {
                     fallback_url: Some(&source),
                     is_binary: true,
                     user_agent: None,
-                    auth_header: None,
                 }])
                 .await
                 .expect("the fallback download carries the repository credential");
@@ -804,6 +842,101 @@ mod tests {
             assert_eq!(test_authorization(&public_seen[0]), None, "{public_seen:?}");
             let private_seen = private_seen.lock().unwrap();
             assert_eq!(test_authorization(&private_seen[0]), Some("Bearer tok123"));
+        }
+
+        // #187: sync used to send a Forgejo/GitLab token to the plan's
+        // primary URL, whatever its host: a P3M or custom-source binary for
+        // a package of the same name got the token. Now a git host's token
+        // goes only to URLs on that host, the source fallback included.
+        #[test]
+        fn git_host_token_stays_on_its_host() {
+            use crate::auth::{test_git_origin, test_private_git_host, GitEnv};
+
+            let _env = GitEnv::new(&["UVR_FORGEJO_TOKEN_FORGEJO_TEST"]);
+            std::env::set_var("UVR_FORGEJO_TOKEN_FORGEJO_TEST", "fj-tok");
+            let (forgejo, forgejo_seen) = test_private_git_host("token fj-tok", |_| {
+                test_response("200 OK", "", b"forgejo tarball")
+            });
+            let (binary, binary_seen) = test_server(|_| test_response("404 Not Found", "", b""));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            test_git_origin("forgejo.test", &forgejo);
+
+            let pkg = LockedPackage {
+                name: "a".into(),
+                version: "1.0".into(),
+                source: PackageSource::Forgejo {
+                    host: "forgejo.test".into(),
+                },
+                raw_version: None,
+                url: None,
+                checksum: Some("git:abc".into()),
+                subdirectory: None,
+                requires: vec![],
+                system_requirements: None,
+                dev: false,
+            };
+            let binary_url = format!("{binary}/bin/a_1.0.tgz");
+            let archive_url = format!("{forgejo}/api/v1/repos/o/a/archive/abc.tar.gz");
+            let tmp = tempfile::tempdir().unwrap();
+            let download = |url: &str, fallback_url: Option<&str>, is_binary: bool| {
+                rt.block_on(
+                    Downloader::new(reqwest::Client::new(), tmp.path().to_path_buf(), 1)
+                        .download_all(&[DownloadSpec {
+                            pkg: &pkg,
+                            url,
+                            fallback_url,
+                            is_binary,
+                            user_agent: None,
+                        }]),
+                )
+                .map(|mut results| results.remove(0))
+            };
+
+            // A binary on another host, then the source on the Forgejo host.
+            let result = download(&binary_url, Some(&archive_url), true)
+                .expect("the fallback download carries the Forgejo token");
+            assert!(!result.used_binary);
+            assert_eq!(std::fs::read(&result.path).unwrap(), b"forgejo tarball");
+            // A locked URL on another host gets no token either.
+            let err = download(
+                &format!("{binary}/api/v1/repos/o/a/archive/x.tar.gz"),
+                None,
+                false,
+            )
+            .err()
+            .expect("another host does not serve the package")
+            .to_string();
+            assert!(!err.contains("fj-tok"), "{err}");
+
+            let binary_seen = binary_seen.lock().unwrap();
+            assert_eq!(binary_seen.len(), 2);
+            for head in binary_seen.iter() {
+                assert_eq!(test_authorization(head), None, "{head}");
+            }
+            let forgejo_seen = forgejo_seen.lock().unwrap();
+            assert_eq!(forgejo_seen.len(), 1);
+            assert_eq!(test_authorization(&forgejo_seen[0]), Some("token fj-tok"));
+            drop(forgejo_seen);
+
+            // A refused token names the variable, not a repository one.
+            std::env::set_var("UVR_FORGEJO_TOKEN_FORGEJO_TEST", "wrong-tok");
+            let other = format!("{forgejo}/api/v1/repos/o/a/archive/def.tar.gz");
+            let err = download(&other, None, false)
+                .err()
+                .expect("a wrong token is refused")
+                .to_string();
+            assert!(
+                err.contains("Forgejo host forgejo.test returned HTTP 401 Unauthorized")
+                    && err.contains("refused the token in UVR_FORGEJO_TOKEN_FORGEJO_TEST"),
+                "{err}"
+            );
+            assert!(
+                !err.contains("wrong-tok") && !err.contains("UVR_REPO_"),
+                "{err}"
+            );
         }
 
         #[tokio::test]

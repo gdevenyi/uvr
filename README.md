@@ -504,9 +504,22 @@ export UVR_REPO_PASSWORD_INTERNAL_PPM=...
   - `machine` is the host name only. It never includes a port, so an entry applies to all ports on that host.
   - uvr does not use a `default` entry, because it would send the same credential to every repository and git host.
   - On Unix, if the file gives any access to users other than you (for example, mode `644` or `640`), uvr shows a warning and does not use the file. The run continues. To fix this, run `chmod 600 ~/.netrc`.
-  - GitHub, GitLab and Forgejo dependencies also use `~/.netrc` when their token variables (`GITHUB_PAT`/`GITHUB_TOKEN`, `UVR_GITLAB_TOKEN[_<HOST>]`, `UVR_FORGEJO_TOKEN[_<HOST>]`) are not set. uvr sends the entry's `password` as the host's access token (GitHub uses `machine github.com`), so the password must be a personal access token, not your account password.
+  - Git hosts also use `~/.netrc`. See **Private git repositories** below.
 - A `401` or `403` response gives an error that names the repository and the variables or netrc entry to set.
 - Credentials written into the URL (`https://user:pass@host/...`) still work, and uvr hides them in its output. But they are also saved in `uvr.lock`, so use the variables. `uvr add --source` does not accept such a URL.
+
+**Private git repositories.** For GitHub, GitLab and Forgejo dependencies, uvr uses the first of these variables that is set as the access token:
+
+| Host | Variables, in order |
+|---|---|
+| GitHub | `GITHUB_PAT`, `GITHUB_TOKEN` |
+| GitLab | `UVR_GITLAB_TOKEN_<HOST>`, `UVR_GITLAB_TOKEN` |
+| Forgejo | `UVR_FORGEJO_TOKEN_<HOST>`, `UVR_FORGEJO_TOKEN` |
+
+- `<HOST>` is the host, changed as `<NAME>` is above (`git.local:3000` → `GIT_LOCAL`).
+- If none of these variables is set, uvr uses the `password` of the `~/.netrc` entry for the host (for GitHub, `machine github.com`). The password must be an access token, not your account password.
+- uvr sends the token with the API requests, the `DESCRIPTION` request and the tarball download (GitHub and GitLab: `Authorization: Bearer`, Forgejo: `Authorization: token`). uvr sends it only to that host: for GitHub, `api.github.com` and `raw.githubusercontent.com`. uvr never sends it to CRAN, P3M, a `[[sources]]` repository, or a different git host.
+- If a host refuses a netrc password (`401`, or `404` from `raw.githubusercontent.com`), uvr shows a warning and does not use that entry again in the same run. uvr then continues without credentials, so public repositories still work. uvr never ignores a token from a variable: if the host refuses it, uvr stops with an error.
 
 ---
 

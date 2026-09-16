@@ -1377,6 +1377,8 @@ mod tests {
             std::fs::write(home.path().join("bin/R"), "#!/bin/sh\n").unwrap();
             std::fs::write(home.path().join("lib/libR.dylib"), header).unwrap();
             let got = Platform::of_r(&home.path().join("bin/R")).unwrap();
+            // uvr has no Windows arm64 platform, so `with_arch` keeps x86_64.
+            let arch = if cfg!(windows) { "x86_64" } else { arch };
             assert_eq!(got.arch(), arch);
             assert_eq!(got.is_macos(), Platform::compiled().unwrap().is_macos());
         }

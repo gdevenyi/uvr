@@ -682,8 +682,8 @@ mod tests {
     fn cache_key_differs_by_checksum() {
         // #189: two URL tarballs with the same name and version but different
         // bytes must not share a built package.
-        let k1 = cache_key("pkg", "1.0", Some("sha256:aa"), "4.4", false, None, None);
-        let k2 = cache_key("pkg", "1.0", Some("sha256:bb"), "4.4", false, None, None);
+        let k1 = cache_key("pkg", "1.0", Some("sha256:aa"), "4.4", A, false, None, None);
+        let k2 = cache_key("pkg", "1.0", Some("sha256:bb"), "4.4", A, false, None, None);
         assert_ne!(k1, k2);
     }
 

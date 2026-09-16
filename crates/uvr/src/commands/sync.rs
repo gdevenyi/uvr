@@ -218,7 +218,8 @@ pub async fn run_inner(
             .context("Failed to re-resolve dependencies for --frozen check")?;
         if !lockfiles_equivalent(&lockfile, &fresh) {
             anyhow::bail!(
-                "Lockfile is out of date with the current manifest.\n\
+                "Lockfile is out of date with the current manifest \
+                 (or a git dependency has moved to a new commit).\n\
                  Run `uvr lock` to update it, then commit the result."
             );
         }
@@ -1674,13 +1675,20 @@ fn installed_version(name: &str, library: &std::path::Path) -> Option<String> {
 }
 
 /// Compare two lockfiles for semantic equivalence, ignoring fields that can
-/// legitimately differ between lockfile versions (e.g. `url`, `checksum`).
+/// legitimately differ between lockfile versions (e.g. `url`).
 /// Compares: R major.minor version + set of (name, version, source,
-/// subdirectory, requires) tuples.
+/// subdirectory, requires) tuples, plus `checksum` for git sources.
+///
+/// A registry version names fixed bytes, so its checksum is ignored. A git
+/// package's `checksum` is its commit (`git:<sha>`), and a branch can move to
+/// a new commit without changing DESCRIPTION's Version (#138). Every uvr has
+/// written that checksum for git sources, so a locked `None` only comes from
+/// a hand-edited lockfile; it counts as drift, and `uvr lock` fixes it.
 fn lockfiles_equivalent(
     a: &uvr_core::lockfile::Lockfile,
     b: &uvr_core::lockfile::Lockfile,
 ) -> bool {
+    use uvr_core::lockfile::PackageSource;
     if r_minor(&a.r.version) != r_minor(&b.r.version) {
         return false;
     }
@@ -1704,6 +1712,12 @@ fn lockfiles_equivalent(
             && ap.source == bp.source
             && ap.subdirectory == bp.subdirectory
             && a_reqs == b_reqs
+            && (!matches!(
+                ap.source,
+                PackageSource::GitHub
+                    | PackageSource::Forgejo { .. }
+                    | PackageSource::Gitlab { .. }
+            ) || ap.checksum == bp.checksum)
     })
 }
 
@@ -2396,7 +2410,7 @@ mod tests {
     }
 
     #[test]
-    fn lockfiles_equivalent_ignores_url_and_checksum() {
+    fn lockfiles_equivalent_cran_ignores_url_and_checksum() {
         let lf1 = Lockfile {
             r: RVersionPin {
                 version: "4.4.2".into(),
@@ -2925,6 +2939,57 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(!lockfiles_equivalent(
             &make(Some("pkgs/rlang")),
             &make(None)
+        ));
+    }
+
+    #[test]
+    fn lockfiles_equivalent_compares_git_commit_but_not_url() {
+        // #138: a branch that moves keeps DESCRIPTION's Version, so only the
+        // `git:<sha>` checksum shows the drift.
+        let make = |source: &PackageSource, checksum: Option<&str>, url: &str| {
+            let mut pkg = nested_locked("rlang", NESTED_SHA, None);
+            pkg.source = source.clone();
+            pkg.checksum = checksum.map(str::to_string);
+            pkg.url = Some(url.to_string());
+            Lockfile {
+                r: RVersionPin {
+                    version: "4.4.2".into(),
+                    bioc_version: None,
+                },
+                packages: vec![pkg],
+            }
+        };
+        let old = format!("git:{NESTED_SHA}");
+        let new = format!("git:{NESTED_OTHER_SHA}");
+        for source in [
+            PackageSource::GitHub,
+            PackageSource::Forgejo {
+                host: "codefloe.com".into(),
+            },
+            PackageSource::Gitlab {
+                host: "gitlab.com".into(),
+            },
+        ] {
+            let locked = make(&source, Some(&old), "https://example.com/a");
+            assert!(!lockfiles_equivalent(
+                &locked,
+                &make(&source, Some(&new), "https://example.com/a")
+            ));
+            assert!(lockfiles_equivalent(
+                &locked,
+                &make(&source, Some(&old), "https://example.com/b")
+            ));
+            // A lock with no recorded commit does not pin one: drift.
+            assert!(!lockfiles_equivalent(
+                &make(&source, None, "https://example.com/a"),
+                &locked
+            ));
+        }
+        // Registry sources keep the version-only comparison.
+        let bioc = PackageSource::Bioconductor;
+        assert!(lockfiles_equivalent(
+            &make(&bioc, Some("md5:abc"), "https://example.com/a"),
+            &make(&bioc, Some("md5:xyz"), "https://example.com/b")
         ));
     }
 

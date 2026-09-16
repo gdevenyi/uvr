@@ -7,6 +7,16 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **`uvr sync --frozen` catches a git dependency whose branch moved** (#138).
+  The check re-resolved and compared each package by version only, so a
+  GitHub, GitLab, or Forgejo branch that gained commits without a new
+  DESCRIPTION `Version` still passed as "up to date". For git sources it now
+  also compares the locked commit (`checksum = "git:<sha>"`). CRAN,
+  Bioconductor, and custom repositories still compare by version, and `url`
+  is still ignored. A project that tracks a moving branch now fails
+  `--frozen` whenever that branch moves; pin `rev` to a tag or commit in
+  `uvr.toml` to keep the gate stable, or run `uvr lock` and commit the result.
+
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption
   that CRAN's framework build links `libomp` itself. It does not: `libR.dylib`

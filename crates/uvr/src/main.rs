@@ -125,7 +125,15 @@ async fn run() -> Result<()> {
             if args.no_binary {
                 std::env::set_var("UVR_NO_BINARY", "1");
             }
-            commands::sync::run(args.frozen, args.no_dev, args.jobs, args.library, timeout).await?;
+            commands::sync::run(
+                args.frozen,
+                args.no_dev,
+                args.jobs,
+                args.library,
+                timeout,
+                args.prune_all,
+            )
+            .await?;
         }
         Commands::Run(args) => {
             commands::run::run(args.script, args.r_version, args.with_packages, args.args).await?;

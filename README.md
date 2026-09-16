@@ -253,6 +253,7 @@ or to the repository root.
 | `uvr sync -v` | Show the resolved install plan first — each package's source and whether it installs from binary or source |
 | `uvr sync --frozen` | Like `sync`, but fail if the lockfile is stale (CI mode) |
 | `uvr sync --no-binary` | Build everything from source, ignoring pre-built binaries |
+| `uvr sync --prune-all` | Also remove packages that are not in `uvr.lock` and that uvr did not install (by default, `sync` keeps packages that `install.packages()` or other tools put into the project library) |
 | `uvr update [pkg...]` | Upgrade packages to latest allowed versions |
 | `uvr update --dry-run` | Show what would change without installing |
 | `uvr lock` | Re-resolve all deps and update `uvr.lock` without installing |

@@ -1,5 +1,6 @@
 pub mod checksum;
 pub mod dcf;
+pub mod dep_spec;
 pub mod env_vars;
 pub mod error;
 pub mod installer;

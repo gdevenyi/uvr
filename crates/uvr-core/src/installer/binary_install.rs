@@ -703,7 +703,16 @@ pub fn inspect_tarball(tarball_path: &Path, package_name: &str) -> Option<Tarbal
         }
         let mut buf = String::new();
         let mut limited = entry.take(32 * 1024);
-        let _ = limited.read_to_string(&mut buf);
+        if let Err(e) = limited.read_to_string(&mut buf) {
+            // Keep going with what was read (nothing, for non-UTF-8): the
+            // classification below falls back to "source" for missing
+            // fields, which is the conservative answer.
+            tracing::warn!(
+                "Could not read {want} in {}: {e}; classifying the tarball from \
+                 what was read",
+                tarball_path.display()
+            );
+        }
 
         let mut meta = TarballMeta::default();
         for line in buf.lines() {

@@ -247,7 +247,8 @@ async fn resolve_lockfile(
     // Lowest resolution needs older CRAN releases, which the index lacks.
     // Each pass reports the packages it looked at without them; load those
     // and resolve again until a pass needs nothing new (#193). Highest
-    // resolution always finishes in one pass.
+    // resolution finishes in one pass unless a bound excludes the current
+    // release, as an override to an older version does (#195).
     let lockfile = loop {
         let result = {
             let mut chain: Vec<&dyn PackageRegistry> = Vec::new();

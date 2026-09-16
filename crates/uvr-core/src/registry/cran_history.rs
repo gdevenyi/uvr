@@ -72,7 +72,7 @@ pub async fn fetch(
                 }
                 None => Err(UvrError::Other(format!(
                     "Failed to fetch the release history of '{name}' from {url}, \
-                     which lowest-version resolution needs: {e}"
+                     which resolving an older release needs: {e}"
                 ))),
             };
         }

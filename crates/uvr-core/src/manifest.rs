@@ -30,6 +30,24 @@ pub struct Manifest {
     /// Optional `[resolution]` block — resolver knobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<ResolutionConfig>,
+
+    /// `[override-dependencies]` — name → exact version. The version replaces
+    /// every requirement on that package, the manifest's own included (#195).
+    #[serde(
+        rename = "override-dependencies",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub override_dependencies: BTreeMap<String, String>,
+
+    /// `[constraint-dependencies]` — name → version range that the package
+    /// must also satisfy if something pulls it in. Adds no dependency (#195).
+    #[serde(
+        rename = "constraint-dependencies",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub constraint_dependencies: BTreeMap<String, String>,
 }
 
 /// `[resolution]` — how dependencies are resolved. Later resolver knobs
@@ -269,6 +287,7 @@ impl std::str::FromStr for Manifest {
         let manifest: Manifest =
             toml::from_str(s).map_err(|e| crate::error::UvrError::ManifestParse(e.to_string()))?;
         manifest.validate_detailed_dependencies()?;
+        manifest.validate_version_tables()?;
         Ok(manifest)
     }
 }
@@ -287,6 +306,8 @@ impl Manifest {
             sources: Vec::new(),
             activate: None,
             resolution: None,
+            override_dependencies: BTreeMap::new(),
+            constraint_dependencies: BTreeMap::new(),
         }
     }
 
@@ -426,6 +447,8 @@ impl Manifest {
             sources: Vec::new(),
             activate: None,
             resolution: None,
+            override_dependencies: BTreeMap::new(),
+            constraint_dependencies: BTreeMap::new(),
         })
     }
 
@@ -473,6 +496,28 @@ impl Manifest {
                 };
                 validate_detailed_dependency(name, section, dep)?;
             }
+        }
+        Ok(())
+    }
+
+    /// An override is an exact version; a constraint is a version range (#195).
+    fn validate_version_tables(&self) -> Result<()> {
+        for (name, version) in &self.override_dependencies {
+            let exact = version.starts_with(|c: char| c.is_ascii_digit())
+                && semver::Version::parse(&crate::resolver::normalize_version(version)).is_ok();
+            if !exact {
+                return Err(UvrError::ManifestParse(format!(
+                    "[override-dependencies] {name} = \"{version}\": an override is an exact \
+                     version, such as \"1.6-5\". Use [constraint-dependencies] for a range."
+                )));
+            }
+        }
+        for (name, range) in &self.constraint_dependencies {
+            crate::resolver::parse_version_req(range).map_err(|e| {
+                UvrError::ManifestParse(format!(
+                    "[constraint-dependencies] {name} = \"{range}\": {e}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -1451,6 +1496,8 @@ bioc = true
         let m: Manifest = canonical.parse().expect("parse");
         assert_eq!(m.resolution, None);
         assert_eq!(m.resolution_strategy(), ResolutionStrategy::Highest);
+        // #195: nor the override / constraint tables.
+        assert!(m.override_dependencies.is_empty() && m.constraint_dependencies.is_empty());
         assert_eq!(m.to_toml_string().expect("serialize"), canonical);
     }
 
@@ -1489,6 +1536,47 @@ bioc = true
             Ok(ResolutionStrategy::LowestDirect)
         );
         assert!("Lowest".parse::<ResolutionStrategy>().is_err());
+    }
+
+    #[test]
+    fn override_and_constraint_tables_round_trip() {
+        // #195: both tables parse and serialize back unchanged.
+        let toml = "[project]\nname = \"pins\"\n\n[dependencies]\nlme4 = \"*\"\n\n\
+                    [override-dependencies]\nMatrix = \"1.6-5\"\n\n\
+                    [constraint-dependencies]\nrlang = \">=1.1.0\"\n";
+        let m: Manifest = toml.parse().expect("parse");
+        assert_eq!(m.override_dependencies["Matrix"], "1.6-5");
+        assert_eq!(m.constraint_dependencies["rlang"], ">=1.1.0");
+        let serialized = m.to_toml_string().expect("serialize");
+        assert_eq!(serialized, toml);
+    }
+
+    #[test]
+    fn override_must_be_an_exact_version() {
+        for bad in [">=1.6", "==1.6-5", "1.6.x", "latest", ""] {
+            let toml =
+                format!("[project]\nname = \"x\"\n\n[override-dependencies]\nMatrix = \"{bad}\"\n");
+            let err = toml.parse::<Manifest>().unwrap_err().to_string();
+            assert!(
+                err.contains("an override is an exact version"),
+                "{bad}: {err}"
+            );
+        }
+        for good in ["1.6-5", "1.0.8.3", "2"] {
+            let toml = format!(
+                "[project]\nname = \"x\"\n\n[override-dependencies]\nMatrix = \"{good}\"\n"
+            );
+            toml.parse::<Manifest>().expect(good);
+        }
+    }
+
+    #[test]
+    fn constraint_must_be_a_version_range() {
+        let err = "[project]\nname = \"x\"\n\n[constraint-dependencies]\nrlang = \"newest\"\n"
+            .parse::<Manifest>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[constraint-dependencies] rlang"), "{err}");
     }
 
     #[test]

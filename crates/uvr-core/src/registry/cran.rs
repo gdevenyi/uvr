@@ -680,18 +680,10 @@ impl CranRegistry {
         }
         self.history_loaded.insert(name.to_string());
     }
-}
 
-impl PackageRegistry for CranRegistry {
-    fn resolve_package(&self, name: &str, constraint: Option<&str>) -> Result<PackageInfo> {
-        let entry = self.index.get_best(name, constraint)?;
-        Ok(self.package_info(entry))
-    }
-
-    fn resolve_package_lowest(&self, name: &str, constraint: Option<&str>) -> Result<PackageInfo> {
-        // The PACKAGES index lists current releases only. Record the gap and
-        // answer from what is loaded; the caller loads the history and
-        // resolves again.
+    /// The PACKAGES index lists current releases only. Record the gap; the
+    /// caller loads the history and resolves again.
+    fn want_history(&self, name: &str) {
         if self.source == PackageSource::Cran
             && self.index.packages.contains_key(name)
             && !self.history_loaded.contains(name)
@@ -701,6 +693,32 @@ impl PackageRegistry for CranRegistry {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(name.to_string());
         }
+    }
+}
+
+impl PackageRegistry for CranRegistry {
+    fn resolve_package(&self, name: &str, constraint: Option<&str>) -> Result<PackageInfo> {
+        let entry = self.index.get_best(name, constraint);
+        // A bound that excludes the current release (`< 1.1`, or `== 1.0.0`
+        // from an override, #195) may fit an older one. A lower bound alone
+        // cannot, so it fails without a history request.
+        if matches!(entry, Err(UvrError::NoMatchingVersion { .. }))
+            && constraint
+                .and_then(|c| parse_version_req(c).ok())
+                .is_some_and(|req| {
+                    req.comparators
+                        .iter()
+                        .any(|c| !matches!(c.op, semver::Op::Greater | semver::Op::GreaterEq))
+                })
+        {
+            self.want_history(name);
+        }
+        Ok(self.package_info(entry?))
+    }
+
+    fn resolve_package_lowest(&self, name: &str, constraint: Option<&str>) -> Result<PackageInfo> {
+        // Answer from what is loaded until the history is in.
+        self.want_history(name);
         let entry = self.index.get_lowest(name, constraint)?;
         Ok(self.package_info(entry))
     }
@@ -1494,6 +1512,91 @@ Imports: Biobase
             "https://cran.example/src/contrib/glue_1.8.0.tar.gz"
         );
         assert_eq!(info.checksum.as_deref(), Some("md5:new"));
+    }
+
+    #[test]
+    fn highest_lookup_asks_for_history_when_a_bound_excludes_the_current_release() {
+        // #195: an override (or an upper bound) can name an older release.
+        let mut reg = cran_registry("Package: glue\nVersion: 1.8.0\n\n");
+        // A floor above the current release: older ones cannot help.
+        assert!(reg.resolve_package("glue", Some(">=2.0")).is_err());
+        assert!(reg.take_wanted_history().is_empty());
+
+        let err = reg.resolve_package("glue", Some("==1.6.0")).unwrap_err();
+        assert!(matches!(err, UvrError::NoMatchingVersion { .. }));
+        assert_eq!(
+            reg.take_wanted_history(),
+            BTreeSet::from(["glue".to_string()])
+        );
+
+        reg.merge_history(
+            "glue",
+            history("Package: glue\nVersion: 1.6.0\n\nPackage: glue\nVersion: 1.7.0\n\n"),
+        );
+        let info = reg.resolve_package("glue", Some("==1.6.0")).unwrap();
+        assert_eq!(
+            info.url,
+            "https://cran.example/src/contrib/Archive/glue/glue_1.6.0.tar.gz"
+        );
+        let info = reg.resolve_package("glue", Some(">=1.0, <1.8")).unwrap();
+        assert_eq!(info.version.to_string(), "1.7.0");
+        // With the history in, a release that never existed fails for good.
+        assert!(matches!(
+            reg.resolve_package("glue", Some("==1.6.5")),
+            Err(UvrError::NoMatchingVersion { .. })
+        ));
+        assert!(reg.take_wanted_history().is_empty());
+    }
+
+    #[test]
+    fn override_to_an_archived_release_resolves_under_highest() {
+        // The `uvr lock` loop with an override below the current release:
+        // pass 1 fails and asks for the history, pass 2 locks the Archive
+        // release even though `app` requires a newer one (#195).
+        use crate::manifest::{DependencySpec, Manifest};
+        use crate::resolver::Resolver;
+
+        let lock_with = |forced: &str| {
+            let mut reg = cran_registry(
+                "Package: app\nVersion: 2.0\nImports: glue (>= 1.7.0)\n\n\
+                 Package: glue\nVersion: 1.8.0\n\n",
+            );
+            let mut manifest = Manifest::new("t", None);
+            manifest.add_dep("app".into(), DependencySpec::Version("*".into()), false);
+            manifest
+                .override_dependencies
+                .insert("glue".into(), forced.into());
+            let mut passes = 0;
+            loop {
+                passes += 1;
+                let result = Resolver::new(&reg).resolve(&manifest, None, None, HashMap::new());
+                let wanted = reg.take_wanted_history();
+                if wanted.is_empty() {
+                    break (result, passes);
+                }
+                for name in wanted {
+                    reg.merge_history(&name, history("Package: glue\nVersion: 1.6.0\n\n"));
+                }
+            }
+        };
+
+        let (lock, passes) = lock_with("1.6.0");
+        let lock = lock.unwrap();
+        assert_eq!(passes, 2);
+        let glue = lock.get_package("glue").unwrap();
+        assert_eq!(glue.version, "1.6.0");
+        assert_eq!(
+            glue.url.as_deref(),
+            Some("https://cran.example/src/contrib/Archive/glue/glue_1.6.0.tar.gz")
+        );
+
+        // A version CRAN never had is an error that names the override.
+        let (lock, passes) = lock_with("1.6.5");
+        assert_eq!(passes, 2);
+        assert_eq!(
+            lock.unwrap_err().to_string(),
+            "No repository has glue 1.6.5, which [override-dependencies] requires"
+        );
     }
 
     #[test]

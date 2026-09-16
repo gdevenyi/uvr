@@ -505,6 +505,43 @@ is no longer on CRAN. Bioconductor packages and custom repositories resolve
 from their index without change (a Bioconductor release has one version of
 each package). Git dependencies stay at the commit that they name.
 
+#### Overrides and constraints
+
+```toml
+[override-dependencies]
+rlang = "1.0.6"       # use this version, whatever a package requires
+
+[constraint-dependencies]
+cli = "<3.6.6"        # applies only if a dependency pulls in cli
+```
+
+An override is an exact version, in R's form (`"1.6-5"` is correct). It
+replaces every requirement on that package, including the requirement in
+`[dependencies]`. Use it when a package requires a version that you cannot
+use. `uvr lock -v` shows the version that each override selects and each
+requirement that it ignores:
+
+```
+DEBUG override rlang = "1.0.6" selects rlang 1.0.6
+DEBUG override rlang = "1.0.6" ignores lifecycle 1.0.5's requirement rlang (>=1.1.0)
+```
+
+R also checks the versions of imports when it loads a package, so a package
+can fail to load with an overridden dependency.
+
+A constraint is a version range that a package must also satisfy. It does
+not add the package to the project: a constraint on a package that nothing
+pulls in has no effect. If no version satisfies both the constraint and the
+requirements, the lock fails and shows the combined range.
+
+Both tables work with all resolution strategies, and an override can select
+an old CRAN release (uvr gets it as described above). They apply to CRAN,
+Bioconductor, and custom-repository packages. A Bioconductor release has one
+version of each package, thus an override there can only select that
+version. An override on a git
+dependency is an error: pin a git dependency with `rev`. A constraint on a git
+dependency is checked like any other requirement.
+
 ---
 
 ## System dependencies (Linux)

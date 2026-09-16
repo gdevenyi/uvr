@@ -295,6 +295,24 @@ fn test_manifest_with_an_unknown_strategy_is_rejected() {
 }
 
 #[test]
+fn test_manifest_with_a_range_override_is_rejected() {
+    // #195: an override is an exact version; ranges belong in constraints.
+    let dir = init_project("rangeoverride");
+    let toml_path = dir.path().join("uvr.toml");
+    let mut toml = fs::read_to_string(&toml_path).unwrap();
+    toml.push_str("\n[override-dependencies]\nrlang = \">=1.0\"\n");
+    fs::write(&toml_path, toml).unwrap();
+    uvr_cmd()
+        .args(["lock"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "[override-dependencies] rlang = \">=1.0\": an override is an exact version",
+        ));
+}
+
+#[test]
 fn test_sync_without_lockfile_fails() {
     let dir = init_project("no-lock-test");
     uvr_cmd()

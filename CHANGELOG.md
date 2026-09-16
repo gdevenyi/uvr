@@ -15,11 +15,10 @@ Pure tracking section — fixes and small features land here between tags.
   could be removed. If `uvr upgrade` cannot install the new binary and then
   cannot put the old one back, the error now gives the path of the backup
   and where to move it, instead of leaving no `uvr` and no explanation.
-  Failed cleanup of a broken R install, an unreadable `DESCRIPTION` in a
-  downloaded tarball, a failed registry cache-meta write, a missing working
-  directory during `.r-version` lookup, and an unusable `Remotes:` entry
-  (now with the name of the package that declares it) are logged as
-  warnings.
+  Failed cleanup of a broken R install, a failed registry cache-meta write,
+  a missing working directory during `.r-version` lookup, and an unusable
+  `Remotes:` entry (now with the name of the package that declares it) are
+  logged as warnings.
 
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption

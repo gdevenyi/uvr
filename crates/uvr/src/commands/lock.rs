@@ -705,7 +705,7 @@ async fn resolve_git_deps(
     // A manifest URL tarball is a manifest source like a git one, so its
     // `Remotes:` join the walk (#244 source-chain rule).
     for (info, remotes, parent_dependencies) in url_seeds {
-        enqueue_remote_entries(&mut queue, remotes, &parent_dependencies)?;
+        enqueue_remote_entries(&mut queue, &info.name, remotes, &parent_dependencies)?;
         resolved_from.insert(info.name.clone(), info.url.clone());
         pre_resolved.insert(info.name.clone(), info);
     }

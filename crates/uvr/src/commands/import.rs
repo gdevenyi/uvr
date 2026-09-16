@@ -231,7 +231,7 @@ pub async fn run(
     init::ensure_positron_settings(&cwd).context("Failed to write Positron settings")?;
     if let Ok(r_binary) = find_r_binary(manifest.project.r_version.as_deref()) {
         if let Some(r_ver) = query_r_version(&r_binary) {
-            crate::commands::sync::ensure_companion_package(&library_path, &r_ver, &r_binary);
+            crate::commands::sync::ensure_companion_package(&library_path, &r_ver, &r_binary)?;
         }
     }
 

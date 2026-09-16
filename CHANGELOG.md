@@ -19,9 +19,10 @@ Pure tracking section — fixes and small features land here between tags.
   arm64 CRAN R used from an Intel uvr gets arm64 ones. `uvr doctor` shows
   the R architecture when it differs from uvr's. Existing installs are not
   replaced (`uvr r install` warns when it keeps one); to move one to arm64,
-  `uvr r uninstall <ver> && uvr r install <ver>`, then delete each affected project's `.uvr/library/` before its
-  next `uvr sync` (sync does not yet notice packages built for the other
-  architecture). `uvr upgrade` still fetches the uvr build you already run.
+  `uvr r uninstall <ver> && uvr r install <ver>`, then delete each affected
+  project's `.uvr/library/` before its next `uvr sync` (sync does not yet
+  notice packages built for the other architecture). `uvr upgrade` still
+  fetches the uvr build you already run.
 
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption

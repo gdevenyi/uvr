@@ -57,14 +57,21 @@ pub struct GitSpec {
 /// is wrong with it. As in the `remotes` package, `@ref` starts at the
 /// first `@` after the first `/` that follows the host, so
 /// `git@host:team/repo.git@v1` and `https://host/repo.git@feature/x` split
-/// correctly. [`validate_url`] lists the URLs that uvr accepts.
+/// correctly. An scp-like URL with no `/` (`git@host:repo.git@v1`) splits
+/// at the first `@` after its last `:`, because a ref cannot hold `:`.
+/// [`validate_url`] lists the URLs that uvr accepts.
 pub fn parse_git_parts(spec: &str) -> std::result::Result<GitSpec, String> {
     let body = spec.strip_prefix("git::").unwrap_or(spec);
     let host_start = body.find("://").map_or(0, |i| i + 3);
-    let at = body[host_start..]
+    let path_start = body[host_start..]
         .find('/')
         .map(|slash| host_start + slash)
-        .and_then(|path| body[path..].find('@').map(|at| path + at));
+        .or_else(|| {
+            body.rfind(':')
+                .filter(|_| host_start == 0)
+                .map(|colon| colon + 1)
+        });
+    let at = path_start.and_then(|path| body[path..].find('@').map(|at| path + at));
     let (url, git_ref) = match at {
         Some(at) => (&body[..at], Some(&body[at + 1..])),
         None => (body, None),
@@ -82,9 +89,9 @@ pub fn parse_git_parts(spec: &str) -> std::result::Result<GitSpec, String> {
 }
 
 /// The spec of a manifest dependency `git = "git::<url>"` with an optional
-/// `rev`. The ref is in `rev` or after `@` in `git`, not in both. (Joining
-/// them as `<url>@<rev>` would split wrongly for a URL with no `/` after the
-/// host, such as `git@host:repo.git`.)
+/// `rev`. The ref is in `rev` or after `@` in `git`, not in both. uvr does
+/// not join them as `<url>@<rev>`, so the URL split rules of
+/// [`parse_git_parts`] do not apply to `rev`.
 pub fn manifest_spec(git: &str, rev: Option<&str>) -> std::result::Result<GitSpec, String> {
     let mut spec = parse_git_parts(git)?;
     if let Some(rev) = rev {
@@ -806,6 +813,8 @@ mod tests {
                 Some("abc123"),
             ),
             ("host:repo.git", "host:repo.git", None),
+            // No `/` in the path (gitolite style).
+            ("git::git@host:repo.git@v1", "git@host:repo.git", Some("v1")),
             ("git::http://host/repo.git", "http://host/repo.git", None),
             (
                 "git::file:///srv/git/repo.git",
@@ -866,7 +875,7 @@ mod tests {
 
     #[test]
     fn manifest_spec_keeps_rev_apart_from_the_url() {
-        // Joined as `git@host:repo.git@v1`, this would not split at all.
+        // Joined as `<url>@<rev>`, a URL with `@` in it would split wrongly.
         assert_eq!(
             manifest_spec("git::git@host:repo.git", Some("v1")),
             Ok(spec("git@host:repo.git", Some("v1")))

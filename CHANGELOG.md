@@ -18,8 +18,8 @@ Pure tracking section — fixes and small features land here between tags.
   Intel R installed before this change keeps getting Intel packages, and an
   arm64 CRAN R used from an Intel uvr gets arm64 ones. `uvr doctor` shows
   the R architecture when it differs from uvr's. Existing installs are not
-  replaced; to move one to arm64, `uvr r uninstall <ver> && uvr r install
-  <ver>`, then delete each affected project's `.uvr/library/` before its
+  replaced (`uvr r install` warns when it keeps one); to move one to arm64,
+  `uvr r uninstall <ver> && uvr r install <ver>`, then delete each affected project's `.uvr/library/` before its
   next `uvr sync` (sync does not yet notice packages built for the other
   architecture). `uvr upgrade` still fetches the uvr build you already run.
 

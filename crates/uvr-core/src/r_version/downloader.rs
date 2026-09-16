@@ -732,6 +732,19 @@ pub async fn download_and_install_r(
         // and reinstall fresh.
         if crate::r_version::detector::query_r_version(&r_binary).is_some() {
             info!("R {version} already installed at {}", install_dir.display());
+            // #155: an Intel R from an older Rosetta uvr is kept as is. Say
+            // so rather than let "installed" suggest it is now native.
+            if let Ok(have) = Platform::of_r(&r_binary) {
+                if have.arch() != platform.arch() {
+                    tracing::warn!(
+                        "R {version} at {} is {}, not {}. To replace it: \
+                         uvr r uninstall {version} && uvr r install {version}",
+                        install_dir.display(),
+                        have.arch(),
+                        platform.arch()
+                    );
+                }
+            }
             return Ok(install_dir);
         }
         info!(

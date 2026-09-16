@@ -273,7 +273,10 @@ pub async fn run(
     }
     ui::bullet_dim(format!("{counts} package(s)"));
     if !custom_sources.is_empty() {
-        let names: Vec<_> = custom_sources.iter().map(|s| s.url.as_str()).collect();
+        let names: Vec<_> = custom_sources
+            .iter()
+            .map(|s| uvr_core::auth::redact_url(&s.url))
+            .collect();
         println!(
             "  {} Added {} custom source(s): {}",
             palette::added(ui::glyph::add()),

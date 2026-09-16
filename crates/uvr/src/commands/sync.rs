@@ -146,7 +146,7 @@ async fn fetch_custom_registries(
                 tracing::warn!(
                     "Failed to fetch custom source '{}' ({}): {e}; treating as non-binary-capable",
                     src.name,
-                    src.url,
+                    uvr_core::auth::redact_url(&src.url),
                 );
             }
         }
@@ -709,25 +709,26 @@ async fn install_from_lockfile_with_r(
         _ => None,
     };
 
+    // Sync-time only: UVR_REPOS env-injected sources are added here so a
+    // CI runner can swap binary mirrors at install time without changing
+    // uvr.toml or contaminating uvr.lock. Lock-time (lock.rs) only sees
+    // uvr.toml's [[sources]], so the lockfile stays reproducible across
+    // environments.
+    let env_repos = uvr_core::env_vars::repos().unwrap_or_default();
+    let combined_sources: Vec<uvr_core::manifest::PackageSource> = env_repos
+        .iter()
+        .map(|r| uvr_core::manifest::PackageSource {
+            name: r.name.clone(),
+            url: r.url.clone(),
+        })
+        .chain(project.manifest.sources.iter().cloned())
+        .collect();
+
     let plans: Vec<PkgPlan> = if !cache_misses.is_empty() {
         // Re-fetch each [[sources]] (HTTP-cached → 304 normally) and partition
         // into binary-capable vs. source-only. A registry is "binary-capable"
         // when at least one of its PACKAGES entries has a Built: line that
         // matches the running host triple + R minor.
-        // Sync-time only: UVR_REPOS env-injected sources are added here so a
-        // CI runner can swap binary mirrors at install time without changing
-        // uvr.toml or contaminating uvr.lock. Lock-time (lock.rs) only sees
-        // uvr.toml's [[sources]], so the lockfile stays reproducible across
-        // environments.
-        let env_repos = uvr_core::env_vars::repos().unwrap_or_default();
-        let combined_sources: Vec<uvr_core::manifest::PackageSource> = env_repos
-            .iter()
-            .map(|r| uvr_core::manifest::PackageSource {
-                name: r.name.clone(),
-                url: r.url.clone(),
-            })
-            .chain(project.manifest.sources.iter().cloned())
-            .collect();
         let custom_registries =
             fetch_custom_registries(&client, &combined_sources, Some(user_agent.as_str())).await;
         let custom_binary: Vec<&uvr_core::registry::cran::CranRegistry> = custom_registries
@@ -771,7 +772,7 @@ async fn install_from_lockfile_with_r(
             if tracing::event_enabled!(tracing::Level::DEBUG) {
                 for reg in &custom_binary {
                     let (name, base) = reg.name_and_base();
-                    ui::bullet_dim(format!("{name} ({base})"));
+                    ui::bullet_dim(format!("{name} ({})", uvr_core::auth::redact_url(base)));
                 }
             }
             None
@@ -853,7 +854,14 @@ async fn install_from_lockfile_with_r(
 
         // Cloned rather than moved: the sysreqs check below still needs the
         // client, and it now runs after the download phase (#207).
-        let downloader = Downloader::new(client.clone(), cache_dir, jobs);
+        // Each [[sources]] repository's env credential (#185), sent only to
+        // URLs under that repository.
+        let repositories = combined_sources
+            .iter()
+            .map(|s| uvr_core::auth::Repository::new(&s.name, &s.url))
+            .collect();
+        let downloader =
+            Downloader::new(client.clone(), cache_dir, jobs).with_repositories(repositories);
         let results = downloader
             .download_all(&specs)
             .await
@@ -953,8 +961,10 @@ async fn install_from_lockfile_with_r(
                     &plan.url
                 };
                 ui::bullet_dim(format!(
-                    "{} {} — {kind_label} — {url}",
-                    plan.pkg.name, plan.pkg.version
+                    "{} {} — {kind_label} — {}",
+                    plan.pkg.name,
+                    plan.pkg.version,
+                    uvr_core::auth::redact_url(url)
                 ));
             }
         }

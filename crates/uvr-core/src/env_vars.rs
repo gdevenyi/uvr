@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 /// Helper to read an environment variable and ignore it if it's empty or just whitespace.
-fn read_env_var(name: &str) -> Option<String> {
+pub(crate) fn read_env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
@@ -172,7 +172,11 @@ fn derive_name_from_url(url: &str) -> String {
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
     let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-    let host_with_port = &after_scheme[..host_end];
+    // Drop any `user:password@` so a secret never becomes the name.
+    let host_with_port = after_scheme[..host_end]
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
     let host = host_with_port.split(':').next().unwrap_or(host_with_port);
     if host.is_empty() {
         url.to_string()
@@ -374,6 +378,11 @@ mod tests {
         env::set_var("UVR_REPOS", "http://localhost:8080/cran");
         let v = repos().expect("one repo with port");
         assert_eq!(v[0].name, "localhost");
+
+        // credentials in the URL never become part of the name (#185)
+        env::set_var("UVR_REPOS", "https://alice:s3cret@ppm.corp:8443/cran");
+        let v = repos().expect("one repo with userinfo");
+        assert_eq!(v[0].name, "ppm.corp");
 
         // whitespace-only → None
         env::set_var("UVR_REPOS", "  ");

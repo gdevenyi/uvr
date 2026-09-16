@@ -178,6 +178,17 @@ pub async fn run(
 
     // If --source is provided, ensure it's in the manifest's [[sources]]
     if let Some(ref url) = source {
+        // uvr.toml names a repository; its secret lives in the environment.
+        if uvr_core::auth::has_userinfo(url) {
+            let host = url.split('/').nth(2).unwrap_or_default();
+            let key = uvr_core::auth::env_key(host.rsplit('@').next().unwrap_or_default());
+            anyhow::bail!(
+                "--source {} has credentials in the URL, which would be saved to uvr.toml. \
+                 Pass the URL without them, and set UVR_REPO_TOKEN_{key}, or \
+                 UVR_REPO_USER_{key} and UVR_REPO_PASSWORD_{key}.",
+                uvr_core::auth::redact_url(url)
+            );
+        }
         let url_trimmed = url.trim_end_matches('/');
         let already_exists = project
             .manifest

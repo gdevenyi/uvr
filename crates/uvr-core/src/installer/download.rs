@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing::debug;
 
+use crate::auth::{self, Repository};
 use crate::checksum;
 use crate::error::{Result, UvrError};
 use crate::lockfile::LockedPackage;
@@ -15,6 +16,7 @@ pub struct Downloader {
     client: reqwest::Client,
     cache_dir: PathBuf,
     concurrency: usize,
+    repositories: Arc<[Repository]>,
 }
 
 impl Downloader {
@@ -23,7 +25,16 @@ impl Downloader {
             client,
             cache_dir,
             concurrency,
+            repositories: Arc::new([]),
         }
+    }
+
+    /// Authenticated repositories (#185). Every request to a URL one of
+    /// them serves carries that repository's credential — primary,
+    /// fallback, and CRAN-Archive retry alike — and no other request does.
+    pub fn with_repositories(mut self, repositories: Vec<Repository>) -> Self {
+        self.repositories = repositories.into();
+        self
     }
 
     /// Download all packages in parallel (bounded by `self.concurrency`).
@@ -44,6 +55,7 @@ impl Downloader {
                 let mp = mp.clone();
                 let client = self.client.clone();
                 let cache_dir = self.cache_dir.clone();
+                let repos = self.repositories.clone();
                 let pkg_name = spec.pkg.name.clone();
                 let pkg_version = spec.pkg.version.clone();
                 let url = spec.url.to_string();
@@ -75,6 +87,7 @@ impl Downloader {
                         primary_checksum.as_deref(),
                         user_agent.as_deref(),
                         auth_header.as_deref(),
+                        &repos,
                         &mp,
                     )
                     .await;
@@ -107,6 +120,7 @@ impl Downloader {
                                 source_checksum.as_deref(),
                                 None, // fallback URL is plain CRAN source — no UA override needed
                                 None, // fallback is a different host; never forward primary auth
+                                &repos,
                                 &mp,
                             )
                             .await?;
@@ -228,6 +242,7 @@ async fn download_one(
     expected_checksum: Option<&str>,
     user_agent: Option<&str>,
     auth_header: Option<&str>,
+    repos: &[Repository],
     mp: &MultiProgress,
 ) -> Result<PathBuf> {
     // Cache filename = short hash of (URL + User-Agent) prefixed onto the URL
@@ -302,13 +317,17 @@ async fn download_one(
 
     // Stream response to a temp file to avoid buffering entire packages in RAM.
     // Compute checksums on-the-fly during the stream.
+    // A repository credential goes only to URLs that repository serves.
     let request = |target: &str, auth: Option<&str>| {
         let mut req = client.get(target);
         if let Some(ua) = user_agent {
             req = req.header(reqwest::header::USER_AGENT, ua);
         }
+        let credential = auth::repository_for(repos, target).and_then(|r| r.credential.as_ref());
         if let Some(auth) = auth {
             req = req.header(reqwest::header::AUTHORIZATION, auth);
+        } else if let Some(credential) = credential {
+            req = credential.apply(req);
         }
         req
     };
@@ -316,9 +335,20 @@ async fn download_one(
         Ok(r) => r.error_for_status(),
         Err(e) => Err(e),
     };
+    // A 401/403 from a known repository is the error to report, even if
+    // the Archive retry below fails for some other reason.
+    let denied = resp_result
+        .as_ref()
+        .err()
+        .and_then(reqwest::Error::status)
+        .and_then(|status| auth::repository_for(repos, url)?.denied_error(status));
     if resp_result.is_err() {
         if let Some(archive_url) = cran_archive_url(url) {
-            debug!("{name}: {url} failed, retrying via CRAN Archive: {archive_url}");
+            debug!(
+                "{name}: {} failed, retrying via CRAN Archive: {}",
+                auth::redact_url(url),
+                auth::redact_url(&archive_url)
+            );
             // CRAN Archive doesn't require the R-shaped UA, but plumbing the
             // override here is harmless and keeps requests symmetric. Pass None
             // for auth: a host-scoped token (e.g. Forgejo) must never leak onto
@@ -329,7 +359,10 @@ async fn download_one(
             };
         }
     }
-    let mut resp = resp_result?;
+    let mut resp = match resp_result {
+        Ok(resp) => resp,
+        Err(e) => return Err(denied.unwrap_or_else(|| e.into())),
+    };
 
     let cache_dir = dest.parent().unwrap_or(std::path::Path::new("."));
     let mut tmp_file = tempfile::Builder::new()
@@ -449,6 +482,7 @@ mod tests {
             expected_checksum,
             None,
             None,
+            &[],
             &indicatif::MultiProgress::new(),
         )
         .await
@@ -676,5 +710,171 @@ mod tests {
             cran_archive_url("https://cran.r-project.org/src/contrib/PACKAGES.gz"),
             None
         );
+    }
+
+    // ── authenticated repositories (#185) ──────────────────────────────
+
+    #[cfg(not(target_os = "windows"))]
+    mod auth {
+        use super::super::{download_one, DownloadSpec, Downloader};
+        use crate::auth::{test_authorization, test_response, test_server, Credential, Repository};
+        use crate::lockfile::{LockedPackage, PackageSource};
+
+        fn repo(url: &str, credential: Option<Credential>) -> Repository {
+            Repository {
+                name: "private".into(),
+                url: url.into(),
+                credential,
+            }
+        }
+
+        fn bearer() -> Option<Credential> {
+            Some(Credential::Bearer("tok123".into()))
+        }
+
+        /// A repository that serves `bytes` only to `Bearer tok123`.
+        fn private_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            test_server(|head| {
+                if test_authorization(head) == Some("Bearer tok123") {
+                    test_response("200 OK", "", b"tarball bytes")
+                } else {
+                    test_response("401 Unauthorized", "WWW-Authenticate: Bearer\r\n", b"")
+                }
+            })
+        }
+
+        async fn fetch(url: &str, repos: &[Repository]) -> crate::error::Result<()> {
+            let tmp = tempfile::tempdir().unwrap();
+            download_one(
+                &reqwest::Client::new(),
+                tmp.path(),
+                "a",
+                "1.0",
+                url,
+                None,
+                None,
+                None,
+                repos,
+                &indicatif::MultiProgress::new(),
+            )
+            .await
+            .map(drop)
+        }
+
+        #[tokio::test]
+        async fn credential_goes_to_the_repository_and_nowhere_else() {
+            let (private, private_seen) = private_server();
+            let (public, public_seen) = test_server(|_| test_response("404 Not Found", "", b""));
+            let pkg = LockedPackage {
+                name: "a".into(),
+                version: "1.0".into(),
+                source: PackageSource::Custom {
+                    name: "private".into(),
+                },
+                raw_version: None,
+                url: None,
+                checksum: None,
+                subdirectory: None,
+                requires: vec![],
+                system_requirements: None,
+                dev: false,
+            };
+            // A binary from another host that 404s, then the source
+            // fallback from the private repository.
+            let binary = format!("{public}/bin/a_1.0.tgz");
+            let source = format!("{private}/cran/src/contrib/a_1.0.tar.gz");
+            let tmp = tempfile::tempdir().unwrap();
+            let results = Downloader::new(reqwest::Client::new(), tmp.path().to_path_buf(), 1)
+                .with_repositories(vec![repo(&format!("{private}/cran"), bearer())])
+                .download_all(&[DownloadSpec {
+                    pkg: &pkg,
+                    url: &binary,
+                    fallback_url: Some(&source),
+                    is_binary: true,
+                    user_agent: None,
+                    auth_header: None,
+                }])
+                .await
+                .expect("the fallback download carries the repository credential");
+            assert!(!results[0].used_binary);
+            assert_eq!(std::fs::read(&results[0].path).unwrap(), b"tarball bytes");
+
+            let public_seen = public_seen.lock().unwrap();
+            assert_eq!(public_seen.len(), 1);
+            assert_eq!(test_authorization(&public_seen[0]), None, "{public_seen:?}");
+            let private_seen = private_seen.lock().unwrap();
+            assert_eq!(test_authorization(&private_seen[0]), Some("Bearer tok123"));
+        }
+
+        #[tokio::test]
+        async fn basic_auth_reaches_the_repository() {
+            let (url, seen) = test_server(|head| match test_authorization(head) {
+                // base64("alice:s3cret")
+                Some("Basic YWxpY2U6czNjcmV0") => test_response("200 OK", "", b"ok"),
+                _ => test_response("401 Unauthorized", "", b""),
+            });
+            let basic = Credential::Basic {
+                username: "alice".into(),
+                password: "s3cret".into(),
+            };
+            fetch(
+                &format!("{url}/src/contrib/a_1.0.tar.gz"),
+                &[repo(&url, Some(basic))],
+            )
+            .await
+            .expect("basic auth accepted");
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
+
+        // reqwest 0.12 drops `Authorization` when a redirect changes host or
+        // port; this pins that behaviour for repository credentials.
+        #[tokio::test]
+        async fn redirect_to_another_host_drops_the_credential() {
+            let (cdn, cdn_seen) = test_server(|_| test_response("200 OK", "", b"from cdn"));
+            let location = format!("Location: {cdn}/blob/a_1.0.tar.gz\r\n");
+            let (private, private_seen) =
+                test_server(move |_| test_response("302 Found", &location, b""));
+
+            fetch(
+                &format!("{private}/a_1.0.tar.gz"),
+                &[repo(&private, bearer())],
+            )
+            .await
+            .expect("redirect followed");
+            let private_seen = private_seen.lock().unwrap();
+            assert_eq!(test_authorization(&private_seen[0]), Some("Bearer tok123"));
+            let cdn_seen = cdn_seen.lock().unwrap();
+            assert_eq!(cdn_seen.len(), 1);
+            assert_eq!(test_authorization(&cdn_seen[0]), None, "{cdn_seen:?}");
+        }
+
+        #[tokio::test]
+        async fn refusal_names_the_repository_and_the_variable() {
+            let (url, seen) = private_server();
+            let tarball = format!("{url}/src/contrib/a_1.0.tar.gz");
+
+            // No credential: say which variable to set, even though the
+            // CRAN-Archive retry is what failed last.
+            let err = fetch(&tarball, &[repo(&url, None)])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("repository 'private'"), "{err}");
+            assert!(err.contains("401 Unauthorized"), "{err}");
+            assert!(err.contains("UVR_REPO_TOKEN_PRIVATE"), "{err}");
+            assert_eq!(seen.lock().unwrap().len(), 2, "primary + Archive retry");
+
+            // A wrong token: say it was refused, never print it.
+            let wrong = Some(Credential::Bearer("wrong-token".into()));
+            let err = fetch(&tarball, &[repo(&url, wrong)])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("refused the token"), "{err}");
+            assert!(!err.contains("wrong-token"), "{err}");
+            // The Archive retry is on the same repository, so it had the token too.
+            let seen = seen.lock().unwrap();
+            assert_eq!(test_authorization(&seen[3]), Some("Bearer wrong-token"));
+        }
     }
 }

@@ -183,6 +183,15 @@ async fn resolve_lockfile(
         // reasoning).
         let mut regs = Vec::new();
         for source in &project.manifest.sources {
+            if uvr_core::auth::has_userinfo(&source.url) {
+                let key = uvr_core::auth::env_key(&source.name);
+                tracing::warn!(
+                    "Repository '{}' has credentials in its uvr.toml URL, so they are also \
+                     written into uvr.lock. Set UVR_REPO_TOKEN_{key}, or UVR_REPO_USER_{key} \
+                     and UVR_REPO_PASSWORD_{key}, instead.",
+                    source.name
+                );
+            }
             let reg = CranRegistry::fetch_custom(client, &source.name, &source.url, upgrade, None)
                 .await
                 .with_context(|| {

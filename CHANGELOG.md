@@ -7,6 +7,17 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Install from authenticated repositories** (#185). A `[[sources]]`
+  repository (a private Posit Package Manager, an internal mirror) can now
+  require credentials. uvr reads them from the environment, keyed by the
+  source name: `UVR_REPO_TOKEN_<NAME>` for a bearer token, or
+  `UVR_REPO_USER_<NAME>` and `UVR_REPO_PASSWORD_<NAME>` for HTTP basic auth,
+  so `uvr.toml` never holds a secret. uvr sends the credential with the index
+  request and with each package download, but only to URLs under that
+  repository. A `401`/`403` names the repository and the variables to set.
+  Credentials never show in output, `-v` included, and `user:pass@` URLs are
+  redacted. `uvr add --source` now refuses a URL that has credentials in it.
+
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption
   that CRAN's framework build links `libomp` itself. It does not: `libR.dylib`

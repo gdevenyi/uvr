@@ -472,6 +472,29 @@ testthat = "*"
 
 Generated or imported git entries may also carry `exact = true`, which preserves an explicit DESCRIPTION `PackageName=` alias and requires the fetched DESCRIPTION `Package:` field to match the manifest dependency name.
 
+### Private repositories
+
+A `[[sources]]` entry adds a CRAN-like repository (for example, a private Posit Package Manager or an internal mirror). `uvr.toml` names the repository. It never holds the secret: uvr reads the credential from the environment, keyed by the repository name.
+
+```toml
+[[sources]]
+name = "internal-ppm"
+url = "https://ppm.corp.example/cran/latest"
+```
+
+```sh
+export UVR_REPO_TOKEN_INTERNAL_PPM=...        # sent as "Authorization: Bearer ..."
+# or HTTP basic auth:
+export UVR_REPO_USER_INTERNAL_PPM=alice
+export UVR_REPO_PASSWORD_INTERNAL_PPM=...
+```
+
+- `<NAME>` is the source `name` with any `:port` suffix removed, in upper case, and with each character that is not a letter or digit changed to `_` (`internal-ppm` → `INTERNAL_PPM`). For `uvr add --source <url>` and `UVR_REPOS`, the name is the URL host (`ppm.corp.example:8443` → `PPM_CORP_EXAMPLE`).
+- If the token is set, uvr uses it and ignores the user and password. uvr removes spaces at the start and end of each value. An empty value counts as not set.
+- uvr sends the credential with the index (`PACKAGES.gz`) request and with each package download, but only to URLs under the source `url`. When a redirect goes to a different host or port, uvr does not send it. uvr never shows it in output (`-v` included), and does not pass it to `R CMD INSTALL`.
+- A `401` or `403` response gives an error that names the repository and the variables to set.
+- Credentials written into the URL (`https://user:pass@host/...`) still work, and uvr hides them in its output. But they are also saved in `uvr.lock`, so use the variables. `uvr add --source` does not accept such a URL.
+
 ---
 
 ## System dependencies (Linux)

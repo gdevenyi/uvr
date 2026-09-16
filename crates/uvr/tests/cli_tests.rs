@@ -770,6 +770,17 @@ impl Drop for StubGuard {
 /// `tests/fixtures/rpkgs-stub/`. Returns the bound URL (`http://127.0.0.1:PORT`)
 /// and a [`StubGuard`]; the server runs until the guard is dropped.
 fn spawn_rpkgs_stub() -> (String, StubGuard) {
+    spawn_stub(fixture("rpkgs-stub"), None)
+}
+
+#[cfg(not(target_os = "windows"))]
+/// [`spawn_rpkgs_stub`] for any `fixtures_root`. With `required_auth`, a
+/// request whose `Authorization` header is not exactly that value gets a
+/// 401, as a private repository would answer (#185).
+fn spawn_stub(
+    fixtures_root: std::path::PathBuf,
+    required_auth: Option<String>,
+) -> (String, StubGuard) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -778,13 +789,6 @@ fn spawn_rpkgs_stub() -> (String, StubGuard) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr");
     let url = format!("http://{}", addr);
-
-    let fixtures_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("tests")
-        .join("fixtures")
-        .join("rpkgs-stub");
 
     listener.set_nonblocking(true).expect("set_nonblocking");
 
@@ -826,7 +830,18 @@ fn spawn_rpkgs_stub() -> (String, StubGuard) {
                         .collect::<Vec<_>>()
                         .join("/");
                     let file_path = fixtures_root.join(&safe_path);
-                    if let Ok(body) = std::fs::read(&file_path) {
+                    let authorized = required_auth.as_deref().is_none_or(|want| {
+                        req.lines().any(|line| {
+                            line.split_once(':').is_some_and(|(k, v)| {
+                                k.eq_ignore_ascii_case("authorization") && v.trim() == want
+                            })
+                        })
+                    });
+                    if !authorized {
+                        let _ = socket.write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    } else if let Ok(body) = std::fs::read(&file_path) {
                         // `Connection: close` tells reqwest not to keep-alive
                         // against our one-shot per-connection handler.
                         let header = format!(
@@ -894,6 +909,238 @@ fn lock_with_binary_capable_source_records_source_urls() {
     assert!(
         lock.contains(&format!("{}/src/contrib/jsonlite", server_url)),
         "lockfile should record the source URL from rpkgs-stub: {lock}"
+    );
+}
+
+// ─── authenticated repositories (#185) ─────────────────────
+
+#[cfg(not(target_os = "windows"))]
+/// A project whose `[[sources]]` entry `private-repo` is a private CRAN-like
+/// repository holding one pure-R package, `uvrauthpkg`, served only to
+/// requests with `Authorization: <required_auth>`. `url_userinfo` (e.g.
+/// `"user:pass@"`) is written into the source URL. Returns the project, a
+/// store for the repository and an isolated cache (with an empty CRAN index,
+/// so resolution needs no network), the repository URL, and its server.
+fn private_repo_project(
+    required_auth: &str,
+    url_userinfo: &str,
+) -> (TempDir, TempDir, String, StubGuard) {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
+    let store = TempDir::new().unwrap();
+    let contrib = store.path().join("repo").join("src").join("contrib");
+    fs::create_dir_all(&contrib).unwrap();
+    let packages = "Package: uvrauthpkg\nVersion: 0.1.0\nNeedsCompilation: no\n";
+    fs::write(contrib.join("PACKAGES"), packages).unwrap();
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(packages.as_bytes()).unwrap();
+    fs::write(contrib.join("PACKAGES.gz"), gz.finish().unwrap()).unwrap();
+
+    let tarball = fs::File::create(contrib.join("uvrauthpkg_0.1.0.tar.gz")).unwrap();
+    let mut tar = tar::Builder::new(GzEncoder::new(tarball, Compression::default()));
+    for (path, body) in [
+        (
+            "uvrauthpkg/DESCRIPTION",
+            "Package: uvrauthpkg\nVersion: 0.1.0\nTitle: Test\nDescription: Test package.\n\
+             License: MIT\nAuthor: uvr\nMaintainer: uvr <uvr@example.com>\nNeedsCompilation: no\n",
+        ),
+        ("uvrauthpkg/NAMESPACE", "export(hello)\n"),
+        ("uvrauthpkg/R/hello.R", "hello <- function() \"hi\"\n"),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        // R's own untar rejects the legacy NUL entry type.
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        tar.append_data(&mut header, path, body.as_bytes()).unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap();
+
+    let cache = store.path().join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("cran-packages.txt"), "").unwrap();
+
+    let (url, guard) = spawn_stub(store.path().join("repo"), Some(required_auth.to_string()));
+    let dir = init_project("authproj");
+    let toml_path = dir.path().join("uvr.toml");
+    let mut toml = fs::read_to_string(&toml_path).unwrap();
+    let source_url = url.replacen("http://", &format!("http://{url_userinfo}"), 1);
+    toml.push_str(&format!(
+        "\n[[sources]]\nname = \"private-repo\"\nurl = \"{source_url}\"\n"
+    ));
+    fs::write(&toml_path, toml).unwrap();
+    (dir, store, url, guard)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn private_repo_cmd(dir: &TempDir, store: &TempDir, env: &[(&str, &str)]) -> Command {
+    let mut cmd = uvr_cmd();
+    cmd.current_dir(dir.path())
+        .env("UVR_CACHE_DIR", store.path().join("cache"))
+        .env("UVR_PACKAGES_DIR", store.path().join("packages"))
+        .env("UVR_NO_BINARY", "1")
+        .env_remove("UVR_REPOS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
+#[cfg(not(target_os = "windows"))]
+fn output_text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+/// Lock `uvrauthpkg` from the private repository and, when R is available,
+/// install it. `secret` must never appear in uvr's output (`-v` included)
+/// nor, unless it was written into the URL, in uvr.toml or uvr.lock.
+fn assert_private_repo_installs(
+    required_auth: &str,
+    url_userinfo: &str,
+    env: &[(&str, &str)],
+    secret: &str,
+) {
+    let (dir, store, url, _server) = private_repo_project(required_auth, url_userinfo);
+
+    let out = private_repo_cmd(&dir, &store, env)
+        .args(["add", "--no-install", "uvrauthpkg"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains(secret), "{text}");
+    let lock = fs::read_to_string(dir.path().join("uvr.lock")).unwrap();
+    assert!(lock.contains("private-repo"), "{lock}");
+    assert!(
+        lock.contains("/src/contrib/uvrauthpkg_0.1.0.tar.gz"),
+        "{lock}"
+    );
+    if url_userinfo.is_empty() {
+        assert!(lock.contains(&url), "{lock}");
+        assert!(!lock.contains(secret), "{lock}");
+        let toml = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
+        assert!(!toml.contains(secret), "{toml}");
+    }
+
+    if !have_r() {
+        eprintln!("skipping the install half: no R on PATH");
+        return;
+    }
+    let out = private_repo_cmd(&dir, &store, env)
+        .args(["sync", "-v"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    // `-v` prints each package's download URL: it must be redacted.
+    assert!(text.contains("uvrauthpkg 0.1.0"), "{text}");
+    assert!(!text.contains(secret), "{text}");
+    assert!(
+        dir.path()
+            .join(".uvr/library/uvrauthpkg/DESCRIPTION")
+            .exists(),
+        "uvrauthpkg must be installed: {text}"
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn private_repository_with_bearer_token_resolves_and_installs() {
+    assert_private_repo_installs(
+        "Bearer tok-185-secret",
+        "",
+        &[("UVR_REPO_TOKEN_PRIVATE_REPO", "tok-185-secret")],
+        "tok-185-secret",
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn private_repository_with_basic_auth_resolves_and_installs() {
+    assert_private_repo_installs(
+        // base64("alice:s3cret-185")
+        "Basic YWxpY2U6czNjcmV0LTE4NQ==",
+        "",
+        &[
+            ("UVR_REPO_USER_PRIVATE_REPO", "alice"),
+            ("UVR_REPO_PASSWORD_PRIVATE_REPO", "s3cret-185"),
+        ],
+        "s3cret-185",
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn private_repository_url_credentials_are_redacted() {
+    assert_private_repo_installs(
+        "Basic YWxpY2U6czNjcmV0LTE4NQ==",
+        "alice:s3cret-185@",
+        &[],
+        "s3cret-185",
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn private_repository_refusal_says_how_to_authenticate() {
+    let (dir, store, _url, _server) = private_repo_project("Bearer tok-185-secret", "");
+    let cases: [(&[(&str, &str)], &str); 2] = [
+        (&[], "it needs credentials. Set UVR_REPO_TOKEN_PRIVATE_REPO"),
+        (
+            // A wrong token is refused, and never echoed back.
+            &[("UVR_REPO_TOKEN_PRIVATE_REPO", "wrong-185")],
+            "refused the token in UVR_REPO_TOKEN_PRIVATE_REPO",
+        ),
+    ];
+    for (env, expected) in cases {
+        let out = private_repo_cmd(&dir, &store, env)
+            .args(["add", "--no-install", "uvrauthpkg"])
+            .output()
+            .unwrap();
+        let text = output_text(&out);
+        assert!(!out.status.success(), "{text}");
+        assert!(text.contains("repository 'private-repo'"), "{text}");
+        assert!(text.contains("401 Unauthorized"), "{text}");
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains("wrong-185"), "{text}");
+    }
+}
+
+#[test]
+fn test_add_source_refuses_credentials_in_the_url() {
+    let dir = init_project("credsrc");
+    let before = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
+    let out = uvr_cmd()
+        .args([
+            "add",
+            "--no-install",
+            "--source",
+            "https://alice:s3cret-185@ppm.corp.example:8443/cran/latest",
+            "jsonlite",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("UVR_REPO_TOKEN_PPM_CORP_EXAMPLE"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("https://***@ppm.corp.example:8443"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("s3cret-185"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("uvr.toml")).unwrap(),
+        before
     );
 }
 

@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use anyhow::{Context, Result};
 
 use uvr_core::lockfile::Lockfile;
-use uvr_core::manifest::DependencySpec;
+use uvr_core::manifest::{DependencySpec, ResolutionStrategy};
 use uvr_core::project::Project;
 use uvr_core::r_version::detector::{find_r_binary, query_r_version};
 use uvr_core::registry::bioconductor::BiocRegistry;
@@ -26,10 +26,10 @@ use crate::ui;
 
 use super::util::{build_client, make_spinner};
 
-pub async fn run(upgrade: bool) -> Result<()> {
+pub async fn run(upgrade: bool, strategy: Option<ResolutionStrategy>) -> Result<()> {
     let project = Project::find_cwd().context("Not inside a uvr project")?;
     let start = ui::now();
-    let lockfile = resolve_and_lock(&project, upgrade).await?;
+    let lockfile = resolve_and_lock_with(&project, upgrade, strategy).await?;
     ui::summary(
         format!("Lockfile updated — {} package(s)", lockfile.packages.len()),
         format!(
@@ -43,10 +43,27 @@ pub async fn run(upgrade: bool) -> Result<()> {
 /// Re-resolve all dependencies and write `uvr.lock`.
 /// Called by `uvr lock`, `uvr add`, and `uvr remove`.
 pub async fn resolve_and_lock(project: &Project, upgrade: bool) -> Result<Lockfile> {
+    resolve_and_lock_with(project, upgrade, None).await
+}
+
+/// `resolve_and_lock` with a `--resolution` override; `None` uses the
+/// manifest's `[resolution] strategy`.
+pub async fn resolve_and_lock_with(
+    project: &Project,
+    upgrade: bool,
+    strategy: Option<ResolutionStrategy>,
+) -> Result<Lockfile> {
     let client = build_client()?;
     let existing = load_existing_lockfile(project);
-    let lockfile =
-        resolve_lockfile(project, &client, upgrade, existing.as_ref(), HashMap::new()).await?;
+    let lockfile = resolve_lockfile(
+        project,
+        &client,
+        upgrade,
+        existing.as_ref(),
+        HashMap::new(),
+        strategy,
+    )
+    .await?;
     project
         .save_lockfile(&lockfile)
         .context("Failed to write uvr.lock")?;
@@ -58,7 +75,15 @@ pub async fn resolve_and_lock(project: &Project, upgrade: bool) -> Result<Lockfi
 pub async fn resolve_only(project: &Project) -> Result<Lockfile> {
     let client = build_client()?;
     let existing = load_existing_lockfile(project);
-    resolve_lockfile(project, &client, false, existing.as_ref(), HashMap::new()).await
+    resolve_lockfile(
+        project,
+        &client,
+        false,
+        existing.as_ref(),
+        HashMap::new(),
+        None,
+    )
+    .await
 }
 
 /// Resolve with upgrade=true WITHOUT writing the lockfile.
@@ -72,22 +97,26 @@ pub async fn resolve_only(project: &Project) -> Result<Lockfile> {
 pub async fn resolve_only_upgraded(
     project: &Project,
     pins: HashMap<String, PackageInfo>,
+    strategy: Option<ResolutionStrategy>,
 ) -> Result<Lockfile> {
     let client = build_client()?;
     // --upgrade: don't reuse locked bioc_version, re-detect fresh
-    resolve_lockfile(project, &client, true, None, pins).await
+    resolve_lockfile(project, &client, true, None, pins, strategy).await
 }
 
 /// Core resolution logic shared by `resolve_and_lock` and `resolve_only`.
 /// `existing` is the current lockfile on disk, used to preserve the locked
 /// Bioconductor version across re-resolves (unless `upgrade` is true).
+/// `strategy` overrides the manifest's `[resolution] strategy`.
 async fn resolve_lockfile(
     project: &Project,
     client: &reqwest::Client,
     upgrade: bool,
     existing: Option<&Lockfile>,
     pins: HashMap<String, PackageInfo>,
+    strategy: Option<ResolutionStrategy>,
 ) -> Result<Lockfile> {
+    let strategy = strategy.unwrap_or_else(|| project.manifest.resolution_strategy());
     // Query the actual running R version to pin in the lockfile.
     let r_constraint = project.manifest.project.r_version.as_deref();
     let r_binary_opt = find_r_binary(r_constraint).ok();
@@ -197,7 +226,7 @@ async fn resolve_lockfile(
     let (cran_result, bioc_result, git_result, custom_result) =
         tokio::join!(cran_fut, bioc_fut, git_fut, custom_fut,);
 
-    let cran = cran_result.context("Failed to fetch CRAN index")?;
+    let mut cran = cran_result.context("Failed to fetch CRAN index")?;
     let bioc_opt = bioc_result?;
     let mut pre_resolved = git_result?;
     let custom_registries: Vec<CranRegistry> = custom_result?;
@@ -215,33 +244,35 @@ async fn resolve_lockfile(
     // The resolver records the Bioconductor release in the lockfile so it's
     // fully self-describing (#153).
     let resolved_bioc = bioc_opt.as_ref().map(|b| b.release());
-    let lockfile = if !custom_registries.is_empty() || bioc_opt.is_some() {
-        let mut chain: Vec<&dyn PackageRegistry> = Vec::new();
-        for reg in &custom_registries {
-            chain.push(reg);
-        }
-        if let Some(ref bioc) = bioc_opt {
-            chain.push(bioc);
-        }
-        chain.push(&cran);
-        let registry = RegistryChain::new(chain);
-        Resolver::new(&registry)
-            .resolve(
+    // Lowest resolution needs older CRAN releases, which the index lacks.
+    // Each pass reports the packages it looked at without them; load those
+    // and resolve again until a pass needs nothing new (#193). Highest
+    // resolution always finishes in one pass.
+    let lockfile = loop {
+        let result = {
+            let mut chain: Vec<&dyn PackageRegistry> = Vec::new();
+            for reg in &custom_registries {
+                chain.push(reg);
+            }
+            if let Some(ref bioc) = bioc_opt {
+                chain.push(bioc);
+            }
+            chain.push(&cran);
+            let registry = RegistryChain::new(chain);
+            Resolver::new(&registry).with_strategy(strategy).resolve(
                 &project.manifest,
                 actual_r_version.as_deref(),
                 resolved_bioc,
-                pre_resolved,
+                pre_resolved.clone(),
             )
-            .context("Dependency resolution failed")?
-    } else {
-        Resolver::new(&cran)
-            .resolve(
-                &project.manifest,
-                actual_r_version.as_deref(),
-                resolved_bioc,
-                pre_resolved,
-            )
-            .context("Dependency resolution failed")?
+        };
+        let wanted = cran.take_wanted_history();
+        if wanted.is_empty() {
+            break result.context("Dependency resolution failed")?;
+        }
+        cran.load_history(client, wanted)
+            .await
+            .context("Failed to load older CRAN releases")?;
     };
 
     spinner.finish_and_clear();

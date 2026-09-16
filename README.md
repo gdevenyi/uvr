@@ -257,6 +257,7 @@ or to the repository root.
 | `uvr update --dry-run` | Show what would change without installing |
 | `uvr lock` | Re-resolve all deps and update `uvr.lock` without installing |
 | `uvr lock --upgrade` | Upgrade all packages to their latest allowed versions |
+| `uvr lock --resolution lowest` | Resolve to the oldest versions the constraints allow, to test declared floors (also on `add` and `update`; see [`[resolution]`](#resolution-strategy)) |
 | `uvr tree` | Show the dependency tree |
 | `uvr tree --depth 1` | Show only direct dependencies |
 | `uvr run [script.R]` | Run a script (or interactive R) with the project library active |
@@ -471,6 +472,38 @@ testthat = "*"
 ```
 
 Generated or imported git entries may also carry `exact = true`, which preserves an explicit DESCRIPTION `PackageName=` alias and requires the fetched DESCRIPTION `Package:` field to match the manifest dependency name.
+
+#### Resolution strategy
+
+```toml
+[resolution]
+strategy = "lowest-direct"   # "highest" (default), "lowest", or "lowest-direct"
+```
+
+The strategy selects which end of each allowed version range uvr uses:
+
+- `highest` (the default) uses the newest release.
+- `lowest` uses the oldest release that each constraint allows, for all
+  packages. Thus `ggplot2 = ">=3.4.0"` resolves to ggplot2 3.4.0, and you can
+  test that floor. A package that no constraint limits resolves to its first
+  CRAN release, which frequently does not build on a current R.
+- `lowest-direct` uses the oldest release for the dependencies in `uvr.toml`,
+  and the newest release for the packages that they pull in. Use this mode to
+  check your own floors in CI.
+
+`--resolution <strategy>` on `uvr lock`, `uvr add`, and `uvr update` overrides
+the setting for one run. The next `uvr add` or `uvr lock` resolves with the
+`uvr.toml` setting again. Thus, to keep a strategy, write it in `uvr.toml`.
+`uvr sync --frozen` also uses the `uvr.toml` setting.
+
+CRAN's package index lists only current releases. For the older releases,
+uvr gets the metadata from [crandb](https://crandb.r-pkg.org) (METACRAN),
+keeps it in `~/.uvr/cache/cran-history/`, and downloads the tarballs from the
+CRAN archive. There are no P3M binaries for old releases, thus `uvr sync`
+builds them from source. uvr does not use a release that needs a package that
+is no longer on CRAN. Bioconductor packages and custom repositories resolve
+from their index without change (a Bioconductor release has one version of
+each package). Git dependencies stay at the commit that they name.
 
 ---
 

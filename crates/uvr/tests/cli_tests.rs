@@ -1583,3 +1583,210 @@ fn test_an_unsupported_r_pin_in_a_header_is_reported_not_swallowed() {
         .stdout(predicate::str::contains("RAN"))
         .stderr(predicate::str::contains("does not honour yet"));
 }
+
+// ─── uvr add/remove --script (#184) ─────────────────────────
+
+/// `uvr <args…>` in `dir`, which must succeed.
+fn uvr_ok(dir: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
+    uvr_cmd()
+        .args(args)
+        .current_dir(dir.path())
+        .assert()
+        .success()
+}
+
+#[test]
+fn test_add_script_writes_a_header_and_remove_takes_it_away() {
+    // Inside a project on purpose: editing a script must leave it alone.
+    // (The default `--jobs` value must not trip the `--script` conflict.)
+    let dir = init_project("proj");
+    let manifest = fs::read(dir.path().join("uvr.toml")).unwrap();
+    let source = "#!/usr/bin/env -S uvr run\r\nprint(1)\r\n";
+    let script = dir.path().join("s.R");
+    fs::write(&script, source).unwrap();
+
+    uvr_ok(
+        &dir,
+        &["add", "jsonlite", "ggplot2@>=3.4", "--script", "s.R"],
+    )
+    .stdout(predicate::str::contains("Nothing installed"));
+    assert_eq!(
+        fs::read_to_string(&script).unwrap(),
+        "#!/usr/bin/env -S uvr run\r\n\
+         # /// script\r\n\
+         # dependencies = [\r\n\
+         #   \"ggplot2>=3.4\",\r\n\
+         #   \"jsonlite\",\r\n\
+         # ]\r\n\
+         # ///\r\n\
+         \r\n\
+         print(1)\r\n"
+    );
+
+    uvr_ok(&dir, &["remove", "jsonlite", "ggplot2", "--script", "s.R"])
+        .stdout(predicate::str::contains("header was removed"));
+    assert_eq!(fs::read_to_string(&script).unwrap(), source);
+
+    assert_eq!(fs::read(dir.path().join("uvr.toml")).unwrap(), manifest);
+    assert!(!dir.path().join("uvr.lock").exists());
+}
+
+#[test]
+fn test_add_script_replaces_a_spec_in_place_and_says_so() {
+    let dir = script_dir(
+        "# /// script\n\
+         # r = \"4.4\"\n\
+         # dependencies = [\n\
+         #   \"cli\",\n\
+         #   \"ggplot2\",  # plots\n\
+         # ]\n\
+         # ///\n\
+         print(1)\n",
+    );
+    uvr_ok(&dir, &["add", "ggplot2>=3.5", "--script", "script.R"])
+        .stdout(predicate::str::contains("(updated)"));
+    // `--bioc` marks the packages it is given, as in a project.
+    uvr_ok(&dir, &["add", "DESeq2", "--bioc", "--script", "script.R"]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        "# /// script\n\
+         # r = \"4.4\"\n\
+         # dependencies = [\n\
+         #   \"cli\",\n\
+         #   \"DESeq2 (bioc)\",\n\
+         #   \"ggplot2>=3.5\",  # plots\n\
+         # ]\n\
+         # ///\n\
+         print(1)\n"
+    );
+}
+
+#[test]
+fn test_add_script_refuses_project_only_flags() {
+    let dir = script_dir("print(1)\n");
+    for flags in [
+        &["--dev"][..],
+        &["--source", "https://example.org"],
+        &["--no-lock"],
+        &["--no-install"],
+        &["--jobs", "2"],
+        &["--timeout", "1m"],
+        &["--install-system-deps"],
+        &["--no-binary"],
+    ] {
+        uvr_cmd()
+            .args(["add", "cli", "--script", "script.R"])
+            .args(flags)
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        "print(1)\n"
+    );
+}
+
+#[test]
+fn test_remove_script_warns_about_a_missing_name_like_remove_does() {
+    let source = "# /// script\n# dependencies = [\"cli\"]\n# ///\n";
+    let dir = script_dir(source);
+    uvr_ok(&dir, &["remove", "nope", "--script", "script.R"]).stderr(predicate::str::contains(
+        "Package 'nope' not in the script header",
+    ));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn test_a_broken_header_is_not_edited() {
+    let source = "# /// script\n# dependencies = [\"cli\"]\nprint(1)\n";
+    let dir = script_dir(source);
+    for args in [
+        ["add", "zoo", "--script", "script.R"],
+        ["remove", "cli", "--script", "script.R"],
+    ] {
+        uvr_cmd()
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "Invalid script header in script.R",
+            ));
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn test_what_add_script_writes_is_what_run_reads() {
+    // Every spec kind, offline: `uvr run` accepts the header `uvr add` wrote
+    // and goes on to look for R, which the impossible pin makes fail. So the
+    // error is about R, never about the header.
+    let dir = script_dir("cat(1)\n");
+    uvr_ok(
+        &dir,
+        &[
+            "add",
+            "ggplot2@>=3.4",
+            "jsonlite",
+            "rladies/praise@v1.0.0",
+            "owner/repo#subdirectory=pkgs/inner",
+            "forgejo::codeberg.org/owner/fpkg",
+            "gitlab::gitlab.com/group/gpkg@main",
+            "--script",
+            "script.R",
+        ],
+    );
+    uvr_ok(
+        &dir,
+        &["add", "DESeq2@>=1.40", "--bioc", "--script", "script.R"],
+    );
+    let text = fs::read_to_string(dir.path().join("script.R")).unwrap();
+    assert!(text.contains("\"DESeq2>=1.40 (bioc)\""), "{text}");
+
+    let output = uvr_cmd()
+        .args(["run", "script.R", "--r-version", "99.9.9"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("R not found"), "{stderr}");
+    assert!(!stderr.contains("script header"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_add_script_keeps_an_executable_script_executable() {
+    // A rename over the file would reset its mode, and `./script` with a
+    // shebang would stop working.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = script_dir("#!/usr/bin/env -S uvr run\nprint(1)\n");
+    let path = dir.path().join("script.R");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    uvr_ok(&dir, &["add", "cli", "--script", "script.R"]);
+    let mode = fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755);
+}
+
+#[test]
+#[ignore = "requires network access to CRAN/P3M and a managed R"]
+fn test_add_script_then_run() {
+    // #184: the header `uvr add --script` writes is one `uvr run` installs.
+    let cache = TempDir::new().unwrap();
+    let dir = script_dir("cat(jsonlite::toJSON(list(ok = TRUE)))\n");
+    uvr_ok(&dir, &["add", "jsonlite@>=1.8", "--script", "script.R"]);
+    uvr_cmd()
+        .args(["run", "script.R"])
+        .current_dir(dir.path())
+        .env("UVR_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ok\""));
+}

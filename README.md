@@ -262,6 +262,8 @@ or to the repository root.
 | `uvr run [script.R]` | Run a script (or interactive R) with the project library active |
 | `uvr run --with pkg` | Run with extra packages available (not added to manifest) |
 | `uvr run script.R` | Run a standalone script from its inline `# /// script` dependency header — outside any project |
+| `uvr add <pkg...> --script script.R` | Add packages to a script's inline header, creating it if needed (installs nothing) |
+| `uvr remove <pkg...> --script script.R` | Remove packages from a script's inline header, dropping it once empty |
 | `uvr activate` | Print how to activate the project in your shell (`source .uvr/activate`) |
 | `uvr r install <ver>` | Download and install a specific R version to `~/.uvr/r-versions/` (override the location with `--install-dir`) |
 | `uvr r install devel` | Install a rolling channel — `devel` or `next`, rebuilt continuously and marked `[unstable]` (not reproducible; don't pin one) |
@@ -319,6 +321,26 @@ what it needs:
 # ]
 # ///
 ```
+
+You can keep the header up to date from the command line, as with
+`uv add --script`:
+
+```console
+$ uvr add jsonlite 'ggplot2>=3.4' --script analysis.R
+$ uvr add DESeq2 --bioc --script analysis.R
+$ uvr remove ggplot2 --script analysis.R
+```
+
+`uvr add --script` creates the header if the file has none (after the shebang
+line, if there is one). It replaces the spec of a package that is already
+listed, adds new entries in the spellings shown above, and keeps a sorted list
+sorted. Only the `dependencies` lines change: other keys, comments, line
+endings and the rest of the file stay as they are. `uvr remove --script`
+deletes the header when nothing is left in it. Neither command reads or writes
+`uvr.toml` or `uvr.lock`, and neither installs anything: the next `uvr run`
+builds the environment. `--bioc` applies as usual; the project-only flags
+(`--dev`, `--source`, `--no-lock`, `--no-install` and the install options)
+are refused.
 
 The dependencies install into a cached environment keyed by the R version
 and the full specs, so the second run of that script — or any other script

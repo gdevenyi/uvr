@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Context, Result};
 
 use uvr_core::error::UvrError;
@@ -84,15 +86,7 @@ pub async fn run(
         resolve_git_pkg_names(&mut parsed).await?;
     }
 
-    // Reject base/recommended packages that ship with R — they can't be installed from CRAN.
-    for (name, _) in &parsed {
-        if is_base_package(name) {
-            anyhow::bail!(
-                "'{}' is a base R package (ships with R itself) and cannot be installed separately.",
-                name
-            );
-        }
-    }
+    reject_base_packages(&parsed)?;
 
     for (name, spec) in &parsed {
         let is_new = project.manifest.add_dep(name.clone(), spec.clone(), dev);
@@ -193,6 +187,68 @@ pub async fn run(
         .await
         .context("Failed to install packages after add")?;
 
+    Ok(())
+}
+
+/// `uvr add --script`: add `packages` to the script's inline header (#184).
+///
+/// Nothing is resolved or installed, as with `uv add --script`: the next
+/// `uvr run` builds the environment from the header. A git package keeps
+/// the name its URL gives, with no DESCRIPTION lookup, because the header
+/// stores only the spec and `uvr run` names it the same way.
+pub fn run_script(path: &Path, packages: &[String], bioc: bool) -> Result<()> {
+    let parsed: Vec<(String, DependencySpec)> = packages
+        .iter()
+        .map(|p| parse_add_spec(p, bioc))
+        .collect::<Result<Vec<_>>>()?;
+    reject_base_packages(&parsed)?;
+
+    let (before, changed) = crate::commands::util::edit_script_header(path, |source| {
+        uvr_core::script_header::upsert(source, &parsed)
+    })?;
+    for (name, spec) in &parsed {
+        if before.contains(name) {
+            println!(
+                "{} {} {} {}",
+                palette::upgraded(ui::glyph::change()),
+                palette::pkg(name),
+                palette::version(format_spec(spec)),
+                palette::dim("(updated)"),
+            );
+        } else {
+            println!(
+                "{} {} {}",
+                palette::added(ui::glyph::add()),
+                palette::pkg(name),
+                palette::version(format_spec(spec))
+            );
+        }
+    }
+    let verb = if changed.is_some() {
+        "Updated"
+    } else {
+        "No change to"
+    };
+    ui::summary(
+        format!("{verb} the script header in {}", path.display()),
+        format!(
+            "Nothing installed yet: `uvr run {}` builds its environment.",
+            path.display()
+        ),
+    );
+    Ok(())
+}
+
+/// Refuse packages that ship with R: no repository serves them.
+fn reject_base_packages(parsed: &[(String, DependencySpec)]) -> Result<()> {
+    for (name, _) in parsed {
+        if is_base_package(name) {
+            anyhow::bail!(
+                "'{}' is a base R package (ships with R itself) and cannot be installed separately.",
+                name
+            );
+        }
+    }
     Ok(())
 }
 

@@ -213,6 +213,50 @@ pub fn parse(raw: &str, bioc: bool) -> Result<(String, DependencySpec)> {
     Ok((name.to_string(), spec))
 }
 
+/// Write `(name, spec)` back as one spec string, in a script header's own
+/// spellings (`ggplot2>=3.4`, `DESeq2 (bioc)`, `owner/repo@ref`).
+///
+/// `None` when the grammar cannot say it — for example a git source whose
+/// name came from its DESCRIPTION rather than its URL. The result is checked
+/// by parsing it again, so whatever is returned reads back as the same pair.
+pub fn format(name: &str, spec: &DependencySpec) -> Option<String> {
+    // `parse` ends a name at the first of `@ < > =`, so a constraint that
+    // starts with none of them (`1.0`, `~1.0`) needs `uvr add`'s `@`.
+    let constraint = |v: &str| {
+        if v.starts_with(['<', '>', '=']) {
+            v.to_string()
+        } else {
+            format!("@{v}")
+        }
+    };
+    let text = match spec {
+        DependencySpec::Version(v) if v == "*" => name.to_string(),
+        DependencySpec::Version(v) => format!("{name}{}", constraint(v)),
+        DependencySpec::Detailed(d) => match &d.git {
+            Some(git) => {
+                let rev = d.rev.as_deref().map(|r| format!("@{r}"));
+                let sub = d
+                    .subdirectory
+                    .as_deref()
+                    .map(|s| format!("#subdirectory={s}"));
+                format!(
+                    "{git}{}{}",
+                    rev.unwrap_or_default(),
+                    sub.unwrap_or_default()
+                )
+            }
+            None => {
+                let version = d.version.as_deref().map(constraint);
+                format!("{name}{} {BIOC_SUFFIX}", version.unwrap_or_default())
+            }
+        },
+    };
+    let round_trips = parse(&text, false).ok()? == (name.to_string(), spec.clone());
+    // A git ref is free text to `parse`, but a header refuses control
+    // characters in any entry.
+    (round_trips && !text.chars().any(char::is_control)).then_some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +352,70 @@ mod tests {
         let (name, spec) = parse("gitlab::gitlab.com/group/sub/pkg", false).unwrap();
         assert_eq!(name, "pkg");
         assert_eq!(spec.git(), Some("gitlab::gitlab.com/group/sub/pkg"));
+    }
+
+    #[test]
+    fn format_writes_every_spec_kind_in_the_header_spelling() {
+        // (what `uvr add` takes, what a header gets). parse(format(x)) == x
+        // for each, which is what lets `uvr add --script` feed `uvr run`.
+        for (raw, bioc, written) in [
+            ("ggplot2", false, "ggplot2"),
+            ("ggplot2@*", false, "ggplot2"),
+            ("ggplot2@>=3.4", false, "ggplot2>=3.4"),
+            ("ggplot2 >= 3.4", false, "ggplot2>= 3.4"),
+            ("ggplot2@==3.5.1", false, "ggplot2==3.5.1"),
+            ("ggplot2@>=3.4, <4", false, "ggplot2>=3.4, <4"),
+            ("ggplot2@1.0", false, "ggplot2@1.0"),
+            ("ggplot2@~3.4", false, "ggplot2@~3.4"),
+            ("DESeq2", true, "DESeq2 (bioc)"),
+            ("DESeq2 (bioc)", false, "DESeq2 (bioc)"),
+            ("DESeq2@>=1.40", true, "DESeq2>=1.40 (bioc)"),
+            ("DESeq2@*", true, "DESeq2@* (bioc)"),
+            ("rladies/praise", false, "rladies/praise"),
+            ("rladies/praise", true, "rladies/praise"),
+            ("tidyverse/ggplot2@main", false, "tidyverse/ggplot2@main"),
+            (
+                "owner/repo@v2#subdirectory=pkgs/inner",
+                false,
+                "owner/repo@v2#subdirectory=pkgs/inner",
+            ),
+            (
+                "owner/repo#subdirectory=inner",
+                false,
+                "owner/repo#subdirectory=inner",
+            ),
+            (
+                "forgejo::codeberg.org/owner/pkg@v1.0",
+                false,
+                "forgejo::codeberg.org/owner/pkg@v1.0",
+            ),
+            (
+                "gitlab::gitlab.com/group/sub/pkg",
+                false,
+                "gitlab::gitlab.com/group/sub/pkg",
+            ),
+        ] {
+            let (name, spec) = parse(raw, bioc).unwrap();
+            let text = format(&name, &spec).unwrap_or_else(|| panic!("{raw}: not writable"));
+            assert_eq!(text, written, "{raw}");
+            assert_eq!(parse(&text, false).unwrap(), (name, spec), "{raw}");
+        }
+    }
+
+    #[test]
+    fn format_refuses_what_the_grammar_cannot_say() {
+        // A git package renamed from its DESCRIPTION: the URL names another.
+        let (_, spec) = parse("nbafrank/uvr-r", false).unwrap();
+        assert_eq!(format("uvr", &spec), None);
+        // A control character in a ref parses, but no header accepts it.
+        let (name, spec) = parse("user/repo@\u{1b}[31mmain", false).unwrap();
+        assert_eq!(format(&name, &spec), None);
+        // Fields only an import sets.
+        let exact = DependencySpec::Detailed(DetailedDep {
+            git: Some("user/repo".into()),
+            exact: true,
+            ..Default::default()
+        });
+        assert_eq!(format("repo", &exact), None);
     }
 }

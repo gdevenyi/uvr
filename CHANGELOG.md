@@ -5,6 +5,8 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 ## Unreleased
 
+- Verify installed and cached URL tarball package provenance before reuse, including same-version content or origin changes. Frozen sync now rejects changed pinned content.
+
 Pure tracking section — fixes and small features land here between tags.
 
 - **Depend on a source tarball by URL** (#189). `uvr add

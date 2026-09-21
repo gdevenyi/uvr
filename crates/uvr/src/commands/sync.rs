@@ -1677,7 +1677,7 @@ fn installed_version(name: &str, library: &std::path::Path) -> Option<String> {
 }
 
 /// Compare two lockfiles for semantic equivalence, ignoring fields that can
-/// legitimately differ between lockfile versions (e.g. `url`, `checksum`).
+/// legitimately differ for registry packages. Pinned sources also compare content identity.
 /// Compares: R major.minor version + set of (name, version, source,
 /// subdirectory, requires) tuples, plus the `url` of a URL package.
 fn lockfiles_equivalent(
@@ -1706,9 +1706,9 @@ fn lockfiles_equivalent(
             && ap.version == bp.version
             && ap.source == bp.source
             && ap.subdirectory == bp.subdirectory
-            // A URL package is identified by its URL (#189); its checksum is
-            // checked at download.
-            && (ap.source != uvr_core::lockfile::PackageSource::Url || ap.url == bp.url)
+            // A URL package is pinned by both origin and content, even at the same version.
+            && (ap.source != uvr_core::lockfile::PackageSource::Url
+                || (ap.url == bp.url && ap.checksum == bp.checksum))
             && a_reqs == b_reqs
     })
 }
@@ -3043,7 +3043,8 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         };
         let a = "https://example.org/a/rlang_1.1.6.tar.gz";
         let b = "https://example.org/b/rlang_1.1.6.tar.gz";
-        assert!(lockfiles_equivalent(
+        // Same-version content changes invalidate a frozen lock as well.
+        assert!(!lockfiles_equivalent(
             &make(a, "sha256:aa"),
             &make(a, "sha256:bb")
         ));
@@ -3175,5 +3176,128 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(!root.join(".Rprofile").exists());
         assert!(!root.join(".vscode").exists());
         assert!(!root.join(".uvr").exists());
+    }
+}
+
+#[cfg(test)]
+mod pinned_source_tests {
+    use super::*;
+    use uvr_core::lockfile::{PackageSource, RVersionPin};
+
+    fn package() -> LockedPackage {
+        LockedPackage {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            raw_version: None,
+            source: PackageSource::Url,
+            url: Some("https://example.org/demo_1.0.0.tar.gz".into()),
+            checksum: Some(format!("sha256:{}", "a".repeat(64))),
+            subdirectory: None,
+            requires: vec![],
+            system_requirements: None,
+            dev: false,
+        }
+    }
+
+    #[test]
+    fn installed_pinned_source_requires_matching_content_and_origin() {
+        let lib = tempfile::tempdir().unwrap();
+        let dir = lib.path().join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("DESCRIPTION"), "Package: demo\nVersion: 1.0.0\n").unwrap();
+        let pkg = package();
+        assert!(
+            !is_installed(&pkg, lib.path()),
+            "old unmarked installs must be rebuilt"
+        );
+        let provenance = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
+        nested_source::write_marker(&dir, &provenance).unwrap();
+        assert!(
+            is_installed(&pkg, lib.path()),
+            "unchanged pinned code can be reused"
+        );
+        let mut other = pkg.clone();
+        other.checksum = Some(format!("sha256:{}", "b".repeat(64)));
+        assert!(
+            !is_installed(&other, lib.path()),
+            "same version, different content"
+        );
+        other = pkg.clone();
+        other.url = Some("https://example.org/other/demo_1.0.0.tar.gz".into());
+        assert!(
+            !is_installed(&other, lib.path()),
+            "same bytes, different source"
+        );
+        other = pkg.clone();
+        other.source = PackageSource::Cran;
+        assert!(
+            !is_installed(&other, lib.path()),
+            "switching back to a registry must rebuild"
+        );
+        std::fs::write(nested_source::marker_path(&dir), "invalid marker").unwrap();
+        assert!(!is_installed(&pkg, lib.path()));
+    }
+
+    #[test]
+    fn frozen_check_compares_pinned_content() {
+        let lock = |pkg| Lockfile {
+            r: RVersionPin {
+                version: "4.5.3".into(),
+                bioc_version: None,
+            },
+            packages: vec![pkg],
+        };
+        let pkg = package();
+        let original = lock(pkg.clone());
+        assert!(lockfiles_equivalent(&original, &original));
+        let mut changed = pkg;
+        changed.checksum = Some(format!("sha256:{}", "b".repeat(64)));
+        assert!(!lockfiles_equivalent(&original, &lock(changed)));
+    }
+
+    #[test]
+    fn malformed_pinned_identity_is_rejected_before_installation() {
+        let mut pkg = package();
+        for bad in [
+            None,
+            Some("".into()),
+            Some("sha256:short".into()),
+            Some("git:short".into()),
+        ] {
+            pkg.checksum = bad;
+            assert!(validate_lock_identity(&Lockfile {
+                r: RVersionPin::default(),
+                packages: vec![pkg.clone()]
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn cache_attachment_preserves_pinned_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = tmp.path().join("cached/demo");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::write(
+            cached.join("DESCRIPTION"),
+            "Package: demo\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        let pkg = package();
+        let provenance = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
+        nested_source::write_marker(&cached, &provenance).unwrap();
+        let library = tmp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        package_cache::clone_to_library(&cached, &library, "demo").unwrap();
+        assert!(is_installed(&pkg, &library));
+        let mut changed = pkg;
+        changed.url = Some("https://example.org/other/demo_1.0.0.tar.gz".into());
+        let different = NestedProvenance::from_locked(&changed).unwrap().unwrap();
+        assert_ne!(provenance.cache_identity(), different.cache_identity());
+        assert!(!nested_source::provenance_matches(
+            &cached,
+            Some(&different)
+        ));
+        assert!(!is_installed(&changed, &library));
     }
 }

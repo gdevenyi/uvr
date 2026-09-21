@@ -477,6 +477,10 @@ URL, such as an internal build artifact or an archived release. `uvr lock`
 downloads it, checks that it is an R source package (not a built binary), and
 records its `sha256` in `uvr.lock`. If the file at that URL changes later,
 `uvr sync` stops with a checksum error; run `uvr lock` to accept the change.
+After re-locking, sync reinstalls changed content even if `Version:` is unchanged.
+Installed packages and cached builds are reused only when their URL and checksum
+match the lock; older unmarked installs are rebuilt once. `sync --frozen` rejects
+a changed checksum without updating the lock.
 The entry name must match the tarball's DESCRIPTION `Package:` field. uvr sends
 no credentials for these downloads.
 

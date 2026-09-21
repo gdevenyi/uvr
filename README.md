@@ -543,6 +543,11 @@ export UVR_REPO_PASSWORD_INTERNAL_PPM=...
 
 ---
 
+For `git::` dependencies, installed packages and cached builds must match the
+locked clone URL and commit, even when the package version is unchanged. Older
+unmarked installs are rebuilt once. `sync --frozen` rejects a changed commit
+without updating the lock.
+
 ## System dependencies (Linux)
 
 On Linux, `uvr sync` automatically checks for missing system libraries and

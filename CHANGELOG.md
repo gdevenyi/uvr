@@ -5,6 +5,8 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 ## Unreleased
 
+- Verify installed and cached generic Git package provenance before reuse, including same-version content or origin changes. Frozen sync now rejects changed pinned content.
+
 Pure tracking section — fixes and small features land here between tags.
 
 - **Packages from any git host** (#190). A dependency can now name a git

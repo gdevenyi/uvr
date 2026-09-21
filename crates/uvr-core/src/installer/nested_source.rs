@@ -5,8 +5,11 @@ use crate::lockfile::LockedPackage;
 
 pub const MARKER_FILENAME: &str = "uvr-nested-source";
 
+/// Provenance for pinned sources; the historical name and marker filename
+/// are retained for compatibility with existing nested GitHub installs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NestedProvenance {
+    pub source: String,
     pub url: String,
     pub checksum: String,
     pub subdirectory: String,
@@ -15,10 +18,26 @@ pub struct NestedProvenance {
 impl NestedProvenance {
     pub fn from_locked(p: &LockedPackage) -> Result<Option<Self>> {
         crate::registry::github::validate_nested_lock_entry(p)?;
+        if let Some((source, url)) = pinned_source(p) {
+            let provenance = Self {
+                source: source.to_string(),
+                url: url.to_string(),
+                checksum: p.checksum.clone().unwrap_or_default(),
+                subdirectory: String::new(),
+            };
+            if Self::parse(&provenance.to_file_contents()).as_ref() != Some(&provenance) {
+                return Err(UvrError::Other(format!(
+                    "Invalid pinned source identity for '{}'; run `uvr lock` to regenerate it",
+                    p.name
+                )));
+            }
+            return Ok(Some(provenance));
+        }
         let Some(subdirectory) = p.subdirectory.as_deref() else {
             return Ok(None);
         };
         Ok(Some(NestedProvenance {
+            source: "github".to_string(),
             url: p.url.clone().unwrap_or_default(),
             checksum: p.checksum.clone().unwrap_or_default(),
             subdirectory: subdirectory.to_string(),
@@ -28,15 +47,15 @@ impl NestedProvenance {
     // The same repository at the same commit holds a different package per subdirectory.
     pub fn cache_identity(&self) -> String {
         format!(
-            "github|{}|{}|{}",
-            self.url, self.checksum, self.subdirectory
+            "{}|{}|{}|{}",
+            self.source, self.url, self.checksum, self.subdirectory
         )
     }
 
     pub fn to_file_contents(&self) -> String {
         format!(
-            "source=github\nurl={}\nchecksum={}\nsubdirectory={}\n",
-            self.url, self.checksum, self.subdirectory
+            "source={}\nurl={}\nchecksum={}\nsubdirectory={}\n",
+            self.source, self.url, self.checksum, self.subdirectory
         )
     }
 
@@ -60,20 +79,44 @@ impl NestedProvenance {
             *slot = Some(value.to_string());
         }
         let (source, url, checksum, subdirectory) = (source?, url?, checksum?, subdirectory?);
-        if source != "github" || url.is_empty() || !crate::subdirectory::is_valid(&subdirectory) {
+        if url.is_empty() || url.chars().any(char::is_control) {
             return None;
         }
-        if !checksum
-            .strip_prefix("git:")
-            .is_some_and(crate::registry::github::is_full_commit_sha)
-        {
+        let hex = |prefix: &str, lengths: &[usize]| {
+            checksum.strip_prefix(prefix).is_some_and(|s| {
+                lengths.contains(&s.len()) && s.bytes().all(|c| c.is_ascii_hexdigit())
+            })
+        };
+        let valid = match source.as_str() {
+            "github" => {
+                crate::subdirectory::is_valid(&subdirectory)
+                    && checksum
+                        .strip_prefix("git:")
+                        .is_some_and(crate::registry::github::is_full_commit_sha)
+            }
+            "git" => {
+                subdirectory.is_empty()
+                    && crate::registry::git_generic::validate_url(&url).is_ok()
+                    && hex("git:", &[40, 64])
+            }
+            _ => false,
+        };
+        if !valid {
             return None;
         }
         Some(NestedProvenance {
+            source,
             url,
             checksum,
             subdirectory,
         })
+    }
+}
+
+fn pinned_source(p: &LockedPackage) -> Option<(&str, &str)> {
+    match &p.source {
+        crate::lockfile::PackageSource::Git { url } => Some(("git", url)),
+        _ => None,
     }
 }
 
@@ -281,6 +324,7 @@ mod tests {
 
     fn provenance(sha: &str, subdirectory: &str) -> NestedProvenance {
         NestedProvenance {
+            source: "github".to_string(),
             url: url_for(sha),
             checksum: format!("git:{sha}"),
             subdirectory: subdirectory.to_string(),

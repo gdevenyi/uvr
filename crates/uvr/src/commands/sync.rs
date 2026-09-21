@@ -1667,7 +1667,7 @@ fn installed_version(name: &str, library: &std::path::Path) -> Option<String> {
 }
 
 /// Compare two lockfiles for semantic equivalence, ignoring fields that can
-/// legitimately differ between lockfile versions (e.g. `url`, `checksum`).
+/// legitimately differ for registry packages. Pinned sources also compare content identity.
 /// Compares: R major.minor version + set of (name, version, source,
 /// subdirectory, requires) tuples.
 fn lockfiles_equivalent(
@@ -1696,6 +1696,8 @@ fn lockfiles_equivalent(
             && ap.version == bp.version
             && ap.source == bp.source
             && ap.subdirectory == bp.subdirectory
+            && (!(matches!(ap.source, uvr_core::lockfile::PackageSource::Git { .. }))
+                || ap.checksum == bp.checksum)
             && a_reqs == b_reqs
     })
 }
@@ -3072,5 +3074,134 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(!root.join(".Rprofile").exists());
         assert!(!root.join(".vscode").exists());
         assert!(!root.join(".uvr").exists());
+    }
+}
+
+#[cfg(test)]
+mod pinned_source_tests {
+    use super::*;
+    use uvr_core::lockfile::{PackageSource, RVersionPin};
+
+    fn package() -> LockedPackage {
+        LockedPackage {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            raw_version: None,
+            source: PackageSource::Git {
+                url: "https://example.org/demo.git".into(),
+            },
+            url: None,
+            checksum: Some(format!("git:{}", "a".repeat(40))),
+            subdirectory: None,
+            requires: vec![],
+            system_requirements: None,
+            dev: false,
+        }
+    }
+
+    #[test]
+    fn installed_pinned_source_requires_matching_content_and_origin() {
+        let lib = tempfile::tempdir().unwrap();
+        let dir = lib.path().join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("DESCRIPTION"), "Package: demo\nVersion: 1.0.0\n").unwrap();
+        let pkg = package();
+        assert!(
+            !is_installed(&pkg, lib.path()),
+            "old unmarked installs must be rebuilt"
+        );
+        let provenance = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
+        nested_source::write_marker(&dir, &provenance).unwrap();
+        assert!(
+            is_installed(&pkg, lib.path()),
+            "unchanged pinned code can be reused"
+        );
+        let mut other = pkg.clone();
+        other.checksum = Some(format!("git:{}", "b".repeat(40)));
+        assert!(
+            !is_installed(&other, lib.path()),
+            "same version, different content"
+        );
+        other = pkg.clone();
+        other.source = PackageSource::Git {
+            url: "https://example.org/other.git".into(),
+        };
+        assert!(
+            !is_installed(&other, lib.path()),
+            "same bytes, different source"
+        );
+        other = pkg.clone();
+        other.source = PackageSource::Cran;
+        assert!(
+            !is_installed(&other, lib.path()),
+            "switching back to a registry must rebuild"
+        );
+        std::fs::write(nested_source::marker_path(&dir), "invalid marker").unwrap();
+        assert!(!is_installed(&pkg, lib.path()));
+    }
+
+    #[test]
+    fn frozen_check_compares_pinned_content() {
+        let lock = |pkg| Lockfile {
+            r: RVersionPin {
+                version: "4.5.3".into(),
+                bioc_version: None,
+            },
+            packages: vec![pkg],
+        };
+        let pkg = package();
+        let original = lock(pkg.clone());
+        assert!(lockfiles_equivalent(&original, &original));
+        let mut changed = pkg;
+        changed.checksum = Some(format!("git:{}", "b".repeat(40)));
+        assert!(!lockfiles_equivalent(&original, &lock(changed)));
+    }
+
+    #[test]
+    fn malformed_pinned_identity_is_rejected_before_installation() {
+        let mut pkg = package();
+        for bad in [
+            None,
+            Some("".into()),
+            Some("sha256:short".into()),
+            Some("git:short".into()),
+        ] {
+            pkg.checksum = bad;
+            assert!(validate_lock_identity(&Lockfile {
+                r: RVersionPin::default(),
+                packages: vec![pkg.clone()]
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn cache_attachment_preserves_pinned_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = tmp.path().join("cached/demo");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::write(
+            cached.join("DESCRIPTION"),
+            "Package: demo\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        let pkg = package();
+        let provenance = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
+        nested_source::write_marker(&cached, &provenance).unwrap();
+        let library = tmp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        package_cache::clone_to_library(&cached, &library, "demo").unwrap();
+        assert!(is_installed(&pkg, &library));
+        let mut changed = pkg;
+        changed.source = PackageSource::Git {
+            url: "https://example.org/changed.git".into(),
+        };
+        let different = NestedProvenance::from_locked(&changed).unwrap().unwrap();
+        assert_ne!(provenance.cache_identity(), different.cache_identity());
+        assert!(!nested_source::provenance_matches(
+            &cached,
+            Some(&different)
+        ));
+        assert!(!is_installed(&changed, &library));
     }
 }

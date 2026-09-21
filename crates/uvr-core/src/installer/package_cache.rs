@@ -988,6 +988,7 @@ mod tests {
         )
         .unwrap();
         let expected = NestedProvenance {
+            source: "github".to_string(),
             url:
                 "https://api.github.com/repos/o/r/tarball/0123456789abcdef0123456789abcdef01234567"
                     .into(),

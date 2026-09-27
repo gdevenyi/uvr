@@ -17,8 +17,7 @@ Pure tracking section — fixes and small features land here between tags.
 - **Git packages stay tied to their pinned source** (#300). Sync no longer
   substitutes a same-name registry binary for a GitHub, GitLab, or Forgejo
   dependency, and it checks installed and cached packages against the commit.
-- **Distro suite maintenance:** refreshed Alpine 3.21/3.22 image versions and
-  retry Debian package installation after refreshing a stale mirror index.
+- **Distro suite maintenance:** refreshed the Alpine 3.21/3.22 image versions.
 
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption

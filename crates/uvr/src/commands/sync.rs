@@ -82,8 +82,15 @@ fn select_pkg_plan<'a>(
 ) -> PkgPlan<'a> {
     let source_url_str = source_url(p, bioc_release);
 
-    // A nested package only exists inside its repository archive; a same-name binary is a different package.
-    if p.subdirectory.is_some() {
+    // A Git repository's pinned commit cannot be substituted with a registry
+    // binary just because the package name and version happen to match.
+    if matches!(
+        p.source,
+        uvr_core::lockfile::PackageSource::GitHub
+            | uvr_core::lockfile::PackageSource::Forgejo { .. }
+            | uvr_core::lockfile::PackageSource::Gitlab { .. }
+    ) || p.subdirectory.is_some()
+    {
         return PkgPlan {
             pkg: p,
             url: source_url_str,
@@ -189,6 +196,10 @@ pub async fn run_inner(
         .ok_or_else(|| anyhow::anyhow!("No lockfile found. Run `uvr lock` to generate one."))?;
     validate_lock_identity(&lockfile)?;
 
+    if frozen {
+        validate_frozen_lock(project, &lockfile)?;
+    }
+
     if let Some(lib) = library_override {
         std::fs::create_dir_all(lib)
             .with_context(|| format!("Failed to create library dir: {}", lib.display()))?;
@@ -210,18 +221,6 @@ pub async fn run_inner(
     // `uvr init`, so we check on every sync.
     if crate::commands::init::is_r_package_dir(&project.root) {
         let _ = crate::commands::init::write_rbuildignore(&project.root);
-    }
-
-    if frozen {
-        let fresh = crate::commands::lock::resolve_only(project)
-            .await
-            .context("Failed to re-resolve dependencies for --frozen check")?;
-        if !lockfiles_equivalent(&lockfile, &fresh) {
-            anyhow::bail!(
-                "Lockfile is out of date with the current manifest.\n\
-                 Run `uvr lock` to update it, then commit the result."
-            );
-        }
     }
 
     // #85: a lockfile resolved for a different R minor must be re-resolved,
@@ -655,7 +654,14 @@ async fn install_from_lockfile_with_r(
             &pkg.version,
             nested_identity.as_deref().or(pkg.checksum.as_deref()),
             &r_minor_str,
-            binary_cache_allowed && nested.is_none(),
+            binary_cache_allowed
+                && nested.is_none()
+                && !matches!(
+                    pkg.source,
+                    uvr_core::lockfile::PackageSource::GitHub
+                        | uvr_core::lockfile::PackageSource::Forgejo { .. }
+                        | uvr_core::lockfile::PackageSource::Gitlab { .. }
+                ),
             libr_path.as_deref(),
             binary_flavor.as_deref(),
         )
@@ -1677,6 +1683,121 @@ fn installed_version(name: &str, library: &std::path::Path) -> Option<String> {
 /// legitimately differ between lockfile versions (e.g. `url`, `checksum`).
 /// Compares: R major.minor version + set of (name, version, source,
 /// subdirectory, requires) tuples.
+/// Frozen sync checks the recorded resolution inputs without consulting live
+/// registries. A new CRAN release must not invalidate an existing lock (#305).
+fn validate_frozen_lock(project: &Project, lockfile: &Lockfile) -> Result<()> {
+    let stale = || {
+        anyhow::anyhow!(
+            "Lockfile is out of date with the current manifest.\n\
+         Run `uvr lock` to update it, then commit the result."
+        )
+    };
+    match lockfile.manifest_fingerprint.as_deref() {
+        Some(recorded) => {
+            if recorded != project.manifest.lock_fingerprint()? {
+                return Err(stale());
+            }
+        }
+        None => validate_legacy_frozen_lock(project, lockfile).map_err(|e| {
+            anyhow::anyhow!("{e}\nRun `uvr lock` to record the manifest in uvr.lock.")
+        })?,
+    }
+
+    // The manifest fingerprint covers the R constraint, while the lock also
+    // records the concrete R minor used to resolve binary/Bioc packages.
+    if let Ok(r_binary) = find_r_binary(project.manifest.project.r_version.as_deref()) {
+        if let Some(active) = query_r_version(&r_binary) {
+            if looks_like_version(&lockfile.r.version)
+                && r_minor(&active) != r_minor(&lockfile.r.version)
+            {
+                anyhow::bail!(
+                    "uvr.lock was resolved for R {}, but the active R is {}. Run `uvr lock` with the intended R version.",
+                    r_minor(&lockfile.r.version),
+                    r_minor(&active)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Older locks have no manifest fingerprint. Validate their direct roots,
+/// constraints, and graph closure locally so existing CI jobs keep working.
+/// Re-locking adds the complete fingerprint for future checks.
+fn validate_legacy_frozen_lock(project: &Project, lockfile: &Lockfile) -> Result<()> {
+    use uvr_core::resolver::{
+        is_base_package, normalize_version, parse_version_req, version_matches_req,
+    };
+
+    let manifest = &project.manifest;
+    let mut reachable = std::collections::HashSet::new();
+    let mut pending = Vec::new();
+    for (name, spec) in manifest
+        .dependencies
+        .iter()
+        .chain(manifest.dev_dependencies.iter())
+    {
+        if is_base_package(name) {
+            continue;
+        }
+        let pkg = lockfile.get_package(name).ok_or_else(|| {
+            anyhow::anyhow!("uvr.lock does not contain manifest dependency {name}")
+        })?;
+        if let Some(req) = spec.version_req().filter(|s| !s.is_empty() && *s != "*") {
+            let version = semver::Version::parse(&normalize_version(&pkg.version))?;
+            if !version_matches_req(&version, &parse_version_req(req)?) {
+                anyhow::bail!("Locked {} {} does not satisfy {req}", name, pkg.version);
+            }
+        }
+        if let Some(git) = spec.git() {
+            let matching_provider = if git.starts_with("forgejo::") {
+                matches!(
+                    pkg.source,
+                    uvr_core::lockfile::PackageSource::Forgejo { .. }
+                )
+            } else if git.starts_with("gitlab::") {
+                matches!(pkg.source, uvr_core::lockfile::PackageSource::Gitlab { .. })
+            } else {
+                matches!(pkg.source, uvr_core::lockfile::PackageSource::GitHub)
+            };
+            if !matching_provider
+                || !pkg
+                    .checksum
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("git:"))
+            {
+                anyhow::bail!("Locked source for {name} does not match its Git dependency");
+            }
+        }
+        if spec.subdirectory() != pkg.subdirectory.as_deref() {
+            anyhow::bail!("Locked package directory for {name} differs from the manifest");
+        }
+        pending.push(name.as_str());
+    }
+    while let Some(name) = pending.pop() {
+        if !reachable.insert(name.to_string()) {
+            continue;
+        }
+        let pkg = lockfile
+            .get_package(name)
+            .ok_or_else(|| anyhow::anyhow!("uvr.lock is missing required package {name}"))?;
+        for dep in &pkg.requires {
+            if !is_base_package(dep) {
+                pending.push(dep);
+            }
+        }
+    }
+    if lockfile
+        .packages
+        .iter()
+        .any(|p| !reachable.contains(&p.name))
+    {
+        anyhow::bail!("uvr.lock contains packages no longer reachable from the manifest");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn lockfiles_equivalent(
     a: &uvr_core::lockfile::Lockfile,
     b: &uvr_core::lockfile::Lockfile,
@@ -2375,6 +2496,7 @@ mod tests {
     #[test]
     fn lockfiles_equivalent_identical() {
         let lf = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
@@ -2396,8 +2518,76 @@ mod tests {
     }
 
     #[test]
+    fn frozen_lock_ignores_new_registry_releases_but_detects_manifest_changes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("uvr.toml");
+        let mut manifest = uvr_core::manifest::Manifest::new("research", None);
+        manifest.add_dep(
+            "rlang".into(),
+            uvr_core::manifest::DependencySpec::Version("*".into()),
+            false,
+        );
+        manifest.write(&path).unwrap();
+        let mut project = Project::find(temp.path()).unwrap();
+        let lock = Lockfile {
+            manifest_fingerprint: Some(manifest.lock_fingerprint().unwrap()),
+            r: RVersionPin {
+                version: "*".into(),
+                bioc_version: None,
+            },
+            packages: vec![locked_pkg(
+                "rlang",
+                "1.1.6",
+                "https://cran.example/rlang.tar.gz",
+            )],
+        };
+        // No registry lookup occurs, so the lock remains valid even when
+        // the current registry offers a newer rlang release.
+        validate_frozen_lock(&project, &lock).unwrap();
+        project.manifest.project.description = Some("updated notes".into());
+        validate_frozen_lock(&project, &lock).unwrap();
+        project.manifest.add_dep(
+            "jsonlite".into(),
+            uvr_core::manifest::DependencySpec::default(),
+            false,
+        );
+        assert!(validate_frozen_lock(&project, &lock).is_err());
+    }
+
+    #[test]
+    fn legacy_frozen_lock_checks_roots_without_network() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("uvr.toml");
+        let mut manifest = uvr_core::manifest::Manifest::new("research", None);
+        manifest.add_dep(
+            "rlang".into(),
+            uvr_core::manifest::DependencySpec::Version(">=1.0".into()),
+            false,
+        );
+        manifest.write(&path).unwrap();
+        let project = Project::find(temp.path()).unwrap();
+        let lock = Lockfile {
+            manifest_fingerprint: None,
+            r: RVersionPin {
+                version: "*".into(),
+                bioc_version: None,
+            },
+            packages: vec![locked_pkg(
+                "rlang",
+                "1.1.6",
+                "https://cran.example/rlang.tar.gz",
+            )],
+        };
+        validate_frozen_lock(&project, &lock).unwrap();
+        let mut missing = lock.clone();
+        missing.packages.clear();
+        assert!(validate_frozen_lock(&project, &missing).is_err());
+    }
+
+    #[test]
     fn lockfiles_equivalent_ignores_url_and_checksum() {
         let lf1 = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
@@ -2416,6 +2606,7 @@ mod tests {
             }],
         };
         let lf2 = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
@@ -2439,6 +2630,7 @@ mod tests {
     #[test]
     fn lockfiles_not_equivalent_different_version() {
         let make = |ver: &str| Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
@@ -2462,6 +2654,7 @@ mod tests {
     #[test]
     fn lockfiles_not_equivalent_different_r_minor() {
         let make = |r_ver: &str| Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: r_ver.into(),
                 bioc_version: None,
@@ -2474,6 +2667,7 @@ mod tests {
     #[test]
     fn lockfiles_equivalent_same_r_minor() {
         let make = |r_ver: &str| Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: r_ver.into(),
                 bioc_version: None,
@@ -2487,6 +2681,7 @@ mod tests {
     #[test]
     fn lockfiles_not_equivalent_different_requires() {
         let make = |requires: Vec<String>| Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
@@ -2704,6 +2899,7 @@ mod tests {
 
     fn lockfile_with(names: &[&str]) -> Lockfile {
         Lockfile {
+            manifest_fingerprint: None,
             r: Default::default(),
             packages: names
                 .iter()
@@ -2906,8 +3102,33 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
     }
 
     #[test]
+    fn select_plan_uses_pinned_archive_for_root_git_packages() {
+        let reg = CranRegistry::for_test(
+            parse_packages_gz(rlang_musl_packages()).unwrap(),
+            "https://rpkgs.example.com/src/contrib".into(),
+        );
+        for source in [
+            PackageSource::GitHub,
+            PackageSource::Gitlab {
+                host: "gitlab.com".into(),
+            },
+            PackageSource::Forgejo {
+                host: "code.example".into(),
+            },
+        ] {
+            let mut pkg = nested_locked("rlang", NESTED_SHA, None);
+            pkg.source = source;
+            let plan = select_pkg_plan(&pkg, &[&reg], None, &musl_host(), "4.5", None);
+            assert!(!plan.is_binary);
+            assert_eq!(Some(plan.url.as_str()), pkg.url.as_deref());
+            assert!(plan.fallback_url.is_none());
+        }
+    }
+
+    #[test]
     fn lockfiles_not_equivalent_different_subdirectory() {
         let make = |subdirectory: Option<&str>| Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
@@ -2938,7 +3159,13 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         let pkg_dir = library.path().join("rlang");
 
         assert!(!is_installed(&nested, library.path()));
+        assert!(!is_installed(&root, library.path()));
+
+        let root_provenance = NestedProvenance::from_locked(&root).unwrap().unwrap();
+        nested_source::write_marker(&pkg_dir, &root_provenance).unwrap();
         assert!(is_installed(&root, library.path()));
+        assert!(!is_installed(&nested, library.path()));
+        nested_source::clear_marker(&pkg_dir).unwrap();
 
         let provenance = NestedProvenance::from_locked(&nested).unwrap().unwrap();
         nested_source::write_marker(&pkg_dir, &provenance).unwrap();
@@ -2955,7 +3182,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         ));
 
         nested_source::clear_marker(&pkg_dir).unwrap();
-        assert!(is_installed(&root, library.path()));
+        assert!(!is_installed(&root, library.path()));
 
         let mut version_mismatch = nested;
         version_mismatch.version = "1.1.7".into();
@@ -2972,6 +3199,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
     #[test]
     fn validate_lock_identity_rejects_inconsistent_nested_entries() {
         let make = |pkg: LockedPackage| Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
@@ -3035,6 +3263,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         broken.checksum = Some("sha256:abc".into());
         project
             .save_lockfile(&Lockfile {
+                manifest_fingerprint: None,
                 r: RVersionPin {
                     version: "4.4.2".into(),
                     bioc_version: None,

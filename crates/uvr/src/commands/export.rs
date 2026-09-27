@@ -412,6 +412,7 @@ mod tests {
         use uvr_core::lockfile::{LockedPackage, Lockfile, RVersionPin};
 
         let lockfile = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".to_string(),
                 bioc_version: None,
@@ -466,6 +467,7 @@ mod tests {
         use uvr_core::lockfile::{LockedPackage, Lockfile, RVersionPin};
 
         let lockfile = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".to_string(),
                 bioc_version: Some("3.18".to_string()),
@@ -536,6 +538,7 @@ mod tests {
         // bioc_version is set, but there are no Bioconductor packages, so no
         // spurious Bioconductor section or Bioc repos should be emitted.
         let lockfile = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".to_string(),
                 bioc_version: Some("3.18".to_string()),
@@ -568,6 +571,7 @@ mod tests {
         use uvr_core::lockfile::{LockedPackage, Lockfile, RVersionPin};
 
         let lockfile = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".to_string(),
                 bioc_version: None,
@@ -617,6 +621,7 @@ mod tests {
     fn single_package_lockfile(pkg: LockedPackage) -> Lockfile {
         use uvr_core::lockfile::RVersionPin;
         Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".to_string(),
                 bioc_version: None,
@@ -699,6 +704,7 @@ mod tests {
         use uvr_core::lockfile::{LockedPackage, Lockfile, PackageSource, RVersionPin};
 
         let lockfile = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".to_string(),
                 bioc_version: None,
@@ -776,6 +782,7 @@ mod tests {
         use uvr_core::lockfile::{LockedPackage, Lockfile, PackageSource, RVersionPin};
 
         let lockfile = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".to_string(),
                 bioc_version: None,
@@ -837,6 +844,7 @@ mod tests {
         use uvr_core::lockfile::{LockedPackage, Lockfile, RVersionPin};
 
         let lockfile = Lockfile {
+            manifest_fingerprint: None,
             r: RVersionPin {
                 version: "4.4.2".to_string(),
                 bioc_version: None,

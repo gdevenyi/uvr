@@ -116,7 +116,14 @@ note "package manager: $PM"
 
 pm_install() {
     case "$PM" in
-        apt-get) DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" ;;
+        apt-get)
+            # Security mirrors can rotate packages between update and install.
+            # Refresh once and retry if the first install sees a stale index.
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"; then
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+            fi
+            ;;
         dnf|yum) "$PM" -y install "$@" ;;
         microdnf) microdnf -y install "$@" ;;
         zypper) zypper --non-interactive --gpg-auto-import-keys install -y "$@" ;;

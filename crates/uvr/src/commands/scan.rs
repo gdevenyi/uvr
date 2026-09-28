@@ -154,9 +154,10 @@ fn has_scannable_extension(path: &Path) -> bool {
 
 /// Strip R `#` comments from source, preserving newlines so line structure
 /// and the surrounding comma-separated structure survive for the box spec
-/// regex. Used by the `box::use` pass; it does not model `#` inside string
-/// literals, which is fine for the top-of-file/top-of-function statements
-/// box uses.
+/// regex. Used by the `box::use` pass, over the whole file. It does not
+/// model `#` inside string literals: `box::use()` arguments never hold
+/// strings, so a `#` in a string elsewhere only truncates its own line (a
+/// `box::use` later on that same line is missed).
 fn strip_r_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -228,7 +229,7 @@ impl PackageDetector {
         // as packages. Callers drop captures containing `/` (module paths)
         // and the `.`/`..` placeholders.
         let box_use_spec = Regex::new(
-            r#"(?:^|,)\s*(?:[A-Za-z][A-Za-z0-9._]*\s*=\s*)?((?:[A-Za-z][A-Za-z0-9._]*|\.{1,2})(?:/[A-Za-z][A-Za-z0-9._]*)*)\s*(?:\[[^\]]*\])?"#,
+            r#"(?:^|,)\s*(?:[A-Za-z][A-Za-z0-9._]*\s*=\s*)?((?:[A-Za-z][A-Za-z0-9._]*|\.{1,2})(?:/(?:[A-Za-z][A-Za-z0-9._]*|\.\.))*)\s*(?:\[[^\]]*\])?"#,
         )
         .expect("box::use spec regex compiles");
 
@@ -369,6 +370,7 @@ box::use(
   gg = ggplot2,            # ggplot2 package, aliased.
   r/module,                # a local module, should be ignored (not an R package).
   ../mod/utils[f,],        # a relative local module, also ignored.
+  ../../mod[f, g],         # grandparent-relative module: attach list must not leak `g`.
 )
 "#;
         let found = detector.extract(src);
@@ -383,6 +385,9 @@ box::use(
         assert!(!found.contains("arrange"), "got {found:?}");
         assert!(!found.contains("module"), "got {found:?}");
         assert!(!found.contains("utils"), "got {found:?}");
+        assert!(!found.contains("mod"), "got {found:?}");
+        assert!(!found.contains("f"), "got {found:?}");
+        assert!(!found.contains("g"), "got {found:?}");
     }
 
     #[test]

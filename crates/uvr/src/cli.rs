@@ -6,7 +6,7 @@ use clap_complete::Shell;
 
 use crate::commands::activate::ActivateShell;
 use crate::commands::export::ExportFormat;
-use crate::ide::IdeArg;
+use crate::ide::Ide;
 
 /// Match the runtime palette: cyan accents for headers/usage, magenta for
 /// literal flag names, yellow for placeholders. Keeps `--help` visually of
@@ -127,9 +127,9 @@ pub struct InitArgs {
     #[arg(long = "r-version", value_name = "CONSTRAINT")]
     pub r_version: Option<String>,
 
-    /// Assume a specific IDE for config generation (positron | rstudio)
-    #[arg(long, value_enum, value_name = "IDE", conflicts_with = "unattended")]
-    pub ide: Option<IdeArg>,
+    /// Assume a specific IDE for config generation (positron)
+    #[arg(long, value_enum, value_name = "IDE")]
+    pub ide: Option<Ide>,
 
     /// Disable IDE-specific config files and messages
     #[arg(long, conflicts_with = "ide")]
@@ -139,7 +139,7 @@ pub struct InitArgs {
     /// `.gitignore`. No `.Rprofile`, activation shims (until you run
     /// `uvr activate`), IDE config, or companion package — the library is
     /// reachable through `uvr run` only.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "ide")]
     pub bare: bool,
 }
 
@@ -240,9 +240,9 @@ pub struct SyncArgs {
     #[arg(long, value_name = "DURATION")]
     pub timeout: Option<String>,
 
-    /// Assume a specific IDE for config generation (positron | rstudio)
-    #[arg(long, value_enum, value_name = "IDE", conflicts_with = "unattended")]
-    pub ide: Option<IdeArg>,
+    /// Assume a specific IDE for config generation (positron)
+    #[arg(long, value_enum, value_name = "IDE")]
+    pub ide: Option<Ide>,
 
     /// Disable IDE-specific config files and messages
     #[arg(long, conflicts_with = "ide")]
@@ -399,9 +399,9 @@ pub struct ImportArgs {
     #[arg(short, long, default_value = "50", value_name = "N")]
     pub jobs: usize,
 
-    /// Assume a specific IDE for config generation (positron | rstudio)
-    #[arg(long, value_enum, value_name = "IDE", conflicts_with = "unattended")]
-    pub ide: Option<IdeArg>,
+    /// Assume a specific IDE for config generation (positron)
+    #[arg(long, value_enum, value_name = "IDE")]
+    pub ide: Option<Ide>,
 
     /// Disable IDE-specific config files and messages
     #[arg(long, conflicts_with = "ide")]

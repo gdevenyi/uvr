@@ -93,11 +93,7 @@ async fn run() -> Result<()> {
 
     match command {
         Commands::Init(args) => {
-            let ide = ide::Ide::resolve(
-                args.ide.map(ide::IdeArg::into_ide),
-                args.no_ide,
-                cli.unattended,
-            );
+            let ide = ide::Ide::resolve(args.ide, args.no_ide);
             commands::init::run(args.name, args.here, args.r_version, ide, args.bare)?;
         }
         Commands::Add(args) => {
@@ -142,11 +138,7 @@ async fn run() -> Result<()> {
             if args.no_binary {
                 std::env::set_var("UVR_NO_BINARY", "1");
             }
-            let ide = ide::Ide::resolve(
-                args.ide.map(ide::IdeArg::into_ide),
-                args.no_ide,
-                cli.unattended,
-            );
+            let ide = ide::Ide::resolve(args.ide, args.no_ide);
             commands::sync::run(
                 args.frozen,
                 args.no_dev,
@@ -179,11 +171,7 @@ async fn run() -> Result<()> {
             // #71: --input/-i is an alternative spelling of the positional path.
             // clap's `conflicts_with` already rejects passing both.
             let path = args.input.or(args.path);
-            let ide = ide::Ide::resolve(
-                args.ide.map(ide::IdeArg::into_ide),
-                args.no_ide,
-                cli.unattended,
-            );
+            let ide = ide::Ide::resolve(args.ide, args.no_ide);
             commands::import::run(path, args.name, args.lock, args.jobs, args.clean_renv, ide)
                 .await?;
         }

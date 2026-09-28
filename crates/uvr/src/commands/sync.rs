@@ -210,10 +210,24 @@ pub async fn run_inner(
             .context("Failed to create .uvr/library/")?;
     }
 
+    if frozen {
+        let fresh = crate::commands::lock::resolve_only(project)
+            .await
+            .context("Failed to re-resolve dependencies for --frozen check")?;
+        if !lockfiles_equivalent(&lockfile, &fresh) {
+            anyhow::bail!(
+                "Lockfile is out of date with the current manifest.\n\
+                 Run `uvr lock` to update it, then commit the result."
+            );
+        }
+    }
+
     // Ensure the project plumbing is present. Bare projects (`uvr init
     // --bare`) stay bare: their library is reached through `uvr run`, so
     // a later sync must not re-add the scaffolding it opted out of.
     // `--unattended` / `UVR_UNATTENDED=1` likewise writes nothing here.
+    // This runs after the `--frozen` validation above: a frozen sync that
+    // bails on a stale lockfile must not write any scaffolding.
     if !project.manifest.project.bare && !uvr_core::env_vars::unattended() {
         // Ensure .Rprofile exists so any R session started from the project
         // root links the uvr library.
@@ -231,18 +245,6 @@ pub async fn run_inner(
         // `uvr init`, so we check on every sync.
         if crate::commands::init::is_r_package_dir(&project.root) {
             let _ = crate::commands::init::write_rbuildignore(&project.root);
-        }
-    }
-
-    if frozen {
-        let fresh = crate::commands::lock::resolve_only(project)
-            .await
-            .context("Failed to re-resolve dependencies for --frozen check")?;
-        if !lockfiles_equivalent(&lockfile, &fresh) {
-            anyhow::bail!(
-                "Lockfile is out of date with the current manifest.\n\
-                 Run `uvr lock` to update it, then commit the result."
-            );
         }
     }
 

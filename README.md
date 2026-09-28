@@ -291,10 +291,10 @@ or to the repository root.
 
 By default `uvr init` / `uvr sync` write a `.Rprofile` block so any R session
 started from the project root links `.uvr/library/`. IDE-specific config is
-opt-in: uvr detects Positron (`POSITRON=1`) and RStudio (`RSTUDIO=1`) from
-their integrated terminals and, for Positron, writes
-`.vscode/settings.json`. Override detection with `--ide=positron|rstudio` or
-`--no-ide`.
+opt-in: uvr detects Positron (`POSITRON=1`) from its integrated terminal and
+writes `.vscode/settings.json`. Override detection with `--ide=positron` or
+`--no-ide`. `--ide` is the extension point for other editors, which can be
+added once there is config worth writing.
 
 For CI/automation, `--unattended` (or `UVR_UNATTENDED=1`) disables IDE config,
 the companion R package, and every working-tree write (`.Rprofile`,
@@ -463,6 +463,10 @@ R versions are installed to `~/.uvr/r-versions/` and managed independently of an
 - name: Run tests
   run: uvr run tests/run_tests.R
 ```
+
+A `--frozen` sync validates the lockfile before writing any project
+scaffolding, so a stale lockfile fails without dirtying the checkout; add
+`--unattended` to also skip the scaffolding writes on success.
 
 ---
 

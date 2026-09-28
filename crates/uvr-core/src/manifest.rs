@@ -55,10 +55,10 @@ pub struct ProjectMeta {
     #[serde(default)]
     pub description: Option<String>,
 
-    /// Created with `uvr init --bare`: the project ships only `uvr.toml`
-    /// and `.uvr/library/`. `.Rprofile`, `.gitignore`, activation shims,
-    /// IDE config, and the companion package are all skipped, and the
-    /// library is reachable through `uvr run` only.
+    /// Created with `uvr init --bare`: the project ships only `uvr.toml`,
+    /// `.uvr/library/`, and a protective `.gitignore`. `.Rprofile`,
+    /// activation shims, IDE config, and the companion package are all
+    /// skipped, and the library is reachable through `uvr run`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub bare: bool,
 }

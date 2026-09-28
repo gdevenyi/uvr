@@ -2,9 +2,14 @@
 //!
 //! uvr writes IDE-specific configuration (Positron's `.vscode/settings.json`)
 //! and prints IDE-oriented hints. That behavior is opt-in: it is enabled when
-//! uvr can see an IDE in the environment (`POSITRON=1` / `RSTUDIO=1`, both set
-//! by the respective IDE's integrated terminal) or when the user forces it
-//! with `--ide`. The default is no IDE, so CI and plain terminals stay clean.
+//! uvr can see Positron in the environment (`POSITRON=1`, set by its
+//! integrated terminal) or when the user forces it with `--ide`. The default
+//! is no IDE, so CI and plain terminals stay clean.
+//!
+//! `--ide` is the extension point for other editors: add a variant to [`Ide`],
+//! a detection branch, and the config writer when there is config worth
+//! writing. RStudio, for example, needs no config here — its library wiring is
+//! already covered by `.Rprofile`.
 //!
 //! `.Rprofile` is deliberately *not* part of this: it is the library wiring
 //! any R session started from the project root needs, IDE or not.
@@ -12,26 +17,23 @@
 use clap::ValueEnum;
 
 /// The IDE a uvr invocation should generate config for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Ide {
-    /// No IDE — don't write IDE config or print IDE hints.
+    /// No IDE — don't write IDE config or print IDE hints. Not a valid `--ide`
+    /// spelling; use `--no-ide`.
+    #[value(skip)]
     None,
     /// Positron — write `.vscode/settings.json` (`positron.r.*`, `r.rterm`,
     /// `r.rpath`).
     Positron,
-    /// RStudio — no `.vscode` config today; `.Rprofile` is already written
-    /// for every mode.
-    Rstudio,
 }
 
 impl Ide {
-    /// Detect an IDE from the environment variables set by its integrated
-    /// terminal. Positron sets `POSITRON=1`; RStudio sets `RSTUDIO=1`.
+    /// Detect an IDE from the environment variable set by its integrated
+    /// terminal. Positron sets `POSITRON=1`.
     pub fn detect() -> Self {
         if env_is_set("POSITRON") {
             Ide::Positron
-        } else if env_is_set("RSTUDIO") {
-            Ide::Rstudio
         } else {
             Ide::None
         }
@@ -39,13 +41,13 @@ impl Ide {
 
     /// Combine explicit CLI overrides with environment detection.
     ///
-    /// Precedence: `--ide` > (`--no-ide` | `--unattended` | `UVR_UNATTENDED=1`)
-    /// > detected `POSITRON=1` / `RSTUDIO=1` > `None`.
-    pub fn resolve(cli: Option<Ide>, no_ide: bool, unattended: bool) -> Self {
+    /// Precedence: `--ide` > (`--no-ide` | `UVR_UNATTENDED=1`)
+    /// > detected `POSITRON=1` > `None`.
+    pub fn resolve(cli: Option<Ide>, no_ide: bool) -> Self {
         if let Some(ide) = cli {
             return ide;
         }
-        if no_ide || unattended || uvr_core::env_vars::unattended() {
+        if no_ide || uvr_core::env_vars::unattended() {
             return Ide::None;
         }
         Self::detect()
@@ -55,23 +57,6 @@ impl Ide {
     /// IDE-oriented "no `.r-version` pin" hint.
     pub fn is_positron(self) -> bool {
         self == Ide::Positron
-    }
-}
-
-/// The `--ide` CLI value. Kept separate from [`Ide`] so `--ide=none` is not
-/// a valid spelling — use `--no-ide` for that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum IdeArg {
-    Positron,
-    Rstudio,
-}
-
-impl IdeArg {
-    pub fn into_ide(self) -> Ide {
-        match self {
-            IdeArg::Positron => Ide::Positron,
-            IdeArg::Rstudio => Ide::Rstudio,
-        }
     }
 }
 
@@ -113,9 +98,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_prefers_positron_over_rstudio() {
+    fn detect_positron() {
         let _env = env_lock();
-        with_env(&[("POSITRON", Some("1")), ("RSTUDIO", Some("1"))], || {
+        with_env(&[("POSITRON", Some("1"))], || {
             assert_eq!(Ide::detect(), Ide::Positron);
         });
     }
@@ -123,7 +108,7 @@ mod tests {
     #[test]
     fn detect_falls_back_to_none() {
         let _env = env_lock();
-        with_env(&[("POSITRON", None), ("RSTUDIO", None)], || {
+        with_env(&[("POSITRON", None)], || {
             assert_eq!(Ide::detect(), Ide::None);
         });
     }
@@ -135,25 +120,25 @@ mod tests {
         with_env(
             &[("POSITRON", Some("1")), ("UVR_UNATTENDED", Some("1"))],
             || {
-                assert_eq!(Ide::resolve(Some(Ide::Rstudio), false, false), Ide::Rstudio);
+                assert_eq!(Ide::resolve(Some(Ide::Positron), false), Ide::Positron);
             },
         );
 
-        // --no-ide / --unattended / UVR_UNATTENDED all force None.
-        with_env(&[("POSITRON", Some("1"))], || {
-            assert_eq!(Ide::resolve(None, true, false), Ide::None);
-            assert_eq!(Ide::resolve(None, false, true), Ide::None);
+        // --no-ide / UVR_UNATTENDED force None.
+        with_env(&[("POSITRON", Some("1")), ("UVR_UNATTENDED", None)], || {
+            assert_eq!(Ide::resolve(None, true), Ide::None);
         });
         with_env(
             &[("POSITRON", Some("1")), ("UVR_UNATTENDED", Some("1"))],
             || {
-                assert_eq!(Ide::resolve(None, false, false), Ide::None);
+                assert_eq!(Ide::resolve(None, false), Ide::None);
             },
         );
 
-        // No override: env detection wins.
-        with_env(&[("RSTUDIO", Some("1"))], || {
-            assert_eq!(Ide::resolve(None, false, false), Ide::Rstudio);
+        // No override: env detection wins. Clear UVR_UNATTENDED so the result
+        // doesn't depend on the terminal the suite is run from.
+        with_env(&[("POSITRON", Some("1")), ("UVR_UNATTENDED", None)], || {
+            assert_eq!(Ide::resolve(None, false), Ide::Positron);
         });
     }
 }

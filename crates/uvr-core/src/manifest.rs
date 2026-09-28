@@ -145,23 +145,11 @@ fn copy_document_key(
     key: &str,
 ) {
     if let Some(item) = desired.get(section).and_then(|table| table.get(key)) {
-        let mut item = item.clone();
-        if let Some(old) = doc.get(section).and_then(|table| table.get(key)) {
-            // Keep an existing dependency on one line when changing a bare
-            // version into a detailed source declaration, including its note.
-            if old.is_value() {
-                if let Some(table) = item.as_table() {
-                    let mut inline = table.clone().into_inline_table();
-                    inline.fmt();
-                    item = toml_edit::Item::Value(toml_edit::Value::InlineTable(inline));
-                }
-            }
-            if let (Some(old), Some(new)) = (old.as_value(), item.as_value_mut()) {
-                *new.decor_mut() = old.decor().clone();
-            } else if let (Some(old), Some(new)) = (old.as_table(), item.as_table_mut()) {
-                *new.decor_mut() = old.decor().clone();
-            }
-        }
+        let item = doc
+            .get(section)
+            .and_then(|table| table.get(key))
+            .map(|old| edited_item_preserving_comments(old, item))
+            .unwrap_or_else(|| item.clone());
         doc[section][key] = item;
     } else if let Some(table) = doc
         .get_mut(section)
@@ -169,6 +157,45 @@ fn copy_document_key(
     {
         table.remove(key);
     }
+}
+
+fn edited_item_preserving_comments(
+    old: &toml_edit::Item,
+    desired: &toml_edit::Item,
+) -> toml_edit::Item {
+    if let (Some(previous), Some(next)) = (old.as_table_like(), desired.as_table_like()) {
+        let mut item = old.clone();
+        let table = item.as_table_like_mut().expect("cloned table");
+        for (key, _) in previous.iter() {
+            if !next.contains_key(key) {
+                table.remove(key);
+            }
+        }
+        for (key, new) in next.iter() {
+            if let Some(current) = table.get_mut(key) {
+                *current = edited_item_preserving_comments(current, new);
+            } else {
+                table.insert(key, new.clone());
+            }
+        }
+        return item;
+    }
+    let mut item = desired.clone();
+    // Keep an existing dependency on one line when changing a bare version
+    // into a detailed source declaration, including its note.
+    if old.is_value() {
+        if let Some(table) = item.as_table() {
+            let mut inline = table.clone().into_inline_table();
+            inline.fmt();
+            item = toml_edit::Item::Value(toml_edit::Value::InlineTable(inline));
+        }
+    }
+    if let (Some(old), Some(new)) = (old.as_value(), item.as_value_mut()) {
+        *new.decor_mut() = old.decor().clone();
+    } else if let (Some(old), Some(new)) = (old.as_table(), item.as_table_mut()) {
+        *new.decor_mut() = old.decor().clone();
+    }
+    item
 }
 
 impl std::str::FromStr for Manifest {
@@ -1576,6 +1603,22 @@ bioc = true
             Manifest::from_file(&path).unwrap().dependencies,
             manifest.dependencies
         );
+    }
+
+    #[test]
+    fn updating_a_detailed_dependency_preserves_field_comments() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("uvr.toml");
+        std::fs::write(&path, "[project]\nname = \"test\"\n\n[dependencies.rlang]\ngit = \"r-lib/rlang\" # upstream\nrev = \"main\" # required for analysis\n").unwrap();
+        let mut manifest = Manifest::from_file(&path).unwrap();
+        let DependencySpec::Detailed(spec) = manifest.dependencies.get_mut("rlang").unwrap() else {
+            panic!("detailed dependency");
+        };
+        spec.rev = Some("v1.1.6".into());
+        manifest.write(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("git = \"r-lib/rlang\" # upstream"));
+        assert!(text.contains("rev = \"v1.1.6\" # required for analysis"));
     }
 
     #[test]

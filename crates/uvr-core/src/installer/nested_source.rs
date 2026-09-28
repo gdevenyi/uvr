@@ -34,6 +34,30 @@ impl NestedProvenance {
                 p.name
             )));
         }
+        let commit = checksum.strip_prefix("git:").unwrap_or_default();
+        let matches_commit = match &p.source {
+            crate::lockfile::PackageSource::Forgejo { host } => {
+                url.strip_prefix(&format!("https://{host}/api/v1/repos/"))
+                    .is_some_and(|path| {
+                        let parts: Vec<_> = path.split('/').collect();
+                        matches!(parts.as_slice(), [owner, repo, "archive", archive]
+                            if !owner.is_empty() && !repo.is_empty() && *archive == format!("{commit}.tar.gz"))
+                    })
+            }
+            crate::lockfile::PackageSource::Gitlab { host } => {
+                url.strip_prefix(&format!("https://{host}/api/v4/projects/"))
+                    .and_then(|path| path.split_once("/repository/archive.tar.gz?sha="))
+                    .is_some_and(|(project, sha)| !project.is_empty() && !project.contains(['/', '?', '#']) && sha == commit)
+            }
+            // GitHub's canonical URL/commit pair was validated above.
+            _ => true,
+        };
+        if !matches_commit {
+            return Err(UvrError::Other(format!(
+                "Git package {} has an archive URL that does not match its pinned source and commit; run `uvr lock`",
+                p.name
+            )));
+        }
         Ok(Some(NestedProvenance {
             source,
             url: url.to_string(),
@@ -393,6 +417,15 @@ mod tests {
         ] {
             let mut pkg = locked(SHA, None);
             pkg.source = source;
+            pkg.url = Some(match &pkg.source {
+                PackageSource::Gitlab { host } => format!(
+                    "https://{host}/api/v4/projects/o%2Fr/repository/archive.tar.gz?sha={SHA}"
+                ),
+                PackageSource::Forgejo { host } => {
+                    format!("https://{host}/api/v1/repos/o/r/archive/{SHA}.tar.gz")
+                }
+                _ => url_for(SHA),
+            });
             let expected = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
             assert!(!provenance_matches(&package, Some(&expected)));
             write_marker(&package, &expected).unwrap();
@@ -401,6 +434,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(!provenance_matches(&package, Some(&other)));
+            pkg.checksum = Some(format!("git:{OTHER_SHA}"));
+            assert!(NestedProvenance::from_locked(&pkg).is_err());
             clear_marker(&package).unwrap();
         }
     }

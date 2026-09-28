@@ -43,8 +43,22 @@ pub async fn run(upgrade: bool) -> Result<()> {
 /// Re-resolve all dependencies and write `uvr.lock`.
 /// Called by `uvr lock`, `uvr add`, and `uvr remove`.
 pub async fn resolve_and_lock(project: &Project, upgrade: bool) -> Result<Lockfile> {
-    let client = build_client()?;
     let existing = load_existing_lockfile(project);
+    if !upgrade {
+        if let Some(mut locked) = existing.clone() {
+            // Reuse the whole resolution only when its inputs still match.
+            // Individual pins lose dependency constraints in legacy locks and
+            // can belong to a different R/Bioconductor release.
+            if super::sync::validate_frozen_lock(project, &locked).is_ok() {
+                locked.manifest_fingerprint = Some(project.manifest.lock_fingerprint()?);
+                project
+                    .save_lockfile(&locked)
+                    .context("Failed to write uvr.lock")?;
+                return Ok(locked);
+            }
+        }
+    }
+    let client = build_client()?;
     let lockfile =
         resolve_lockfile(project, &client, upgrade, existing.as_ref(), HashMap::new()).await?;
     project
@@ -193,42 +207,9 @@ async fn resolve_lockfile(
     let bioc_opt = bioc_result?;
     let mut pre_resolved = git_result?;
     let custom_registries: Vec<CranRegistry> = custom_result?;
-    let mut stable_pins = std::collections::HashSet::new();
-
-    // A plain `uvr lock` should keep compatible locked registry versions.
-    // Fresh index entries are for new dependencies; `--upgrade` opts into
-    // newer versions of packages already in the lock (#305).
-    if !upgrade {
-        if let Some(existing) = existing {
-            for pkg in &existing.packages {
-                if matches!(
-                    pkg.source,
-                    uvr_core::lockfile::PackageSource::Cran
-                        | uvr_core::lockfile::PackageSource::Bioconductor
-                        | uvr_core::lockfile::PackageSource::Custom { .. }
-                ) && !pre_resolved.contains_key(&pkg.name)
-                    && project
-                        .manifest
-                        .dependencies
-                        .get(&pkg.name)
-                        .or_else(|| project.manifest.dev_dependencies.get(&pkg.name))
-                        .is_none_or(|spec| spec.git().is_none())
-                {
-                    stable_pins.insert(pkg.name.clone());
-                    pre_resolved.insert(
-                        pkg.name.clone(),
-                        uvr_core::resolver::locked_to_package_info(pkg)?,
-                    );
-                }
-            }
-        }
-    }
 
     // Pins override even git-resolved entries: a non-targeted git package
     // must stay at its locked commit, not drift to a fresh HEAD (#127).
-    for name in pins.keys() {
-        stable_pins.remove(name);
-    }
     pre_resolved.extend(pins);
 
     // Build the registry chain: custom sources → Bioconductor → CRAN.
@@ -257,45 +238,17 @@ async fn resolve_lockfile(
         .as_ref()
         .map(|chain| chain as &dyn PackageRegistry)
         .unwrap_or(&cran);
-    let lockfile = resolve_with_stable_pins(
-        registry,
-        &project.manifest,
-        actual_r_version.as_deref(),
-        resolved_bioc,
-        pre_resolved,
-        stable_pins,
-    )?;
+    let lockfile = Resolver::new(registry)
+        .resolve(
+            &project.manifest,
+            actual_r_version.as_deref(),
+            resolved_bioc,
+            pre_resolved,
+        )
+        .context("Dependency resolution failed")?;
 
     spinner.finish_and_clear();
     Ok(lockfile)
-}
-
-fn resolve_with_stable_pins(
-    registry: &dyn PackageRegistry,
-    manifest: &uvr_core::manifest::Manifest,
-    r_version: Option<&str>,
-    bioc_version: Option<&str>,
-    mut pre_resolved: HashMap<String, PackageInfo>,
-    mut stable_pins: std::collections::HashSet<String>,
-) -> Result<Lockfile> {
-    loop {
-        match Resolver::new(registry).resolve(
-            manifest,
-            r_version,
-            bioc_version,
-            pre_resolved.clone(),
-        ) {
-            Ok(lockfile) => return Ok(lockfile),
-            Err(uvr_core::error::UvrError::VersionConflict { package, .. })
-                if stable_pins.remove(&package) =>
-            {
-                // A new or tightened dependency needs a newer version.
-                // Release only that old pin and try again.
-                pre_resolved.remove(&package);
-            }
-            Err(e) => return Err(e).context("Dependency resolution failed"),
-        }
-    }
 }
 
 /// Load the existing lockfile, warning (not erroring) on parse failures.
@@ -796,43 +749,23 @@ mod tests {
     use super::*;
     use uvr_core::manifest::{RemoteEntry, RemoteProvider, RemoteSource};
 
-    #[test]
-    fn plain_lock_releases_only_a_conflicting_old_version() {
-        struct NewestRegistry;
-        impl PackageRegistry for NewestRegistry {
-            fn resolve_package(
-                &self,
-                name: &str,
-                _constraint: Option<&str>,
-            ) -> uvr_core::error::Result<PackageInfo> {
-                Ok(info(name, "2.0.0"))
-            }
-        }
-        fn info(name: &str, version: &str) -> PackageInfo {
-            PackageInfo {
-                name: name.into(),
-                version: semver::Version::parse(version).unwrap(),
-                source: uvr_core::lockfile::PackageSource::Cran,
-                checksum: None,
-                requires: Vec::new(),
-                url: String::new(),
-                raw_version: None,
-                system_requirements: None,
-                subdirectory: None,
-            }
-        }
+    #[tokio::test]
+    async fn plain_lock_reuses_an_unchanged_resolution_without_network() {
+        let temp = tempfile::TempDir::new().unwrap();
         let mut manifest = uvr_core::manifest::Manifest::new("test", None);
-        manifest.add_dep("a".into(), DependencySpec::Version(">=2.0".into()), false);
-        manifest.add_dep("b".into(), DependencySpec::Version("*".into()), false);
-        let pins = HashMap::from([
-            ("a".into(), info("a", "1.0.0")),
-            ("b".into(), info("b", "1.0.0")),
-        ]);
-        let stable = ["a".into(), "b".into()].into_iter().collect();
-        let lock =
-            resolve_with_stable_pins(&NewestRegistry, &manifest, None, None, pins, stable).unwrap();
-        assert_eq!(lock.get_package("a").unwrap().version, "2.0.0");
-        assert_eq!(lock.get_package("b").unwrap().version, "1.0.0");
+        manifest.add_dep(
+            "jsonlite".into(),
+            DependencySpec::Version("*".into()),
+            false,
+        );
+        manifest.write(&temp.path().join("uvr.toml")).unwrap();
+        let project = Project::find(temp.path()).unwrap();
+        let mut locked: Lockfile = "[r]\nversion = \"*\"\n\n[[package]]\nname = \"jsonlite\"\nversion = \"1.8.8\"\nsource = \"cran\"\nurl = \"https://cran.example/jsonlite_1.8.8.tar.gz\"\n".parse().unwrap();
+        locked.manifest_fingerprint = Some(manifest.lock_fingerprint().unwrap());
+        project.save_lockfile(&locked).unwrap();
+        let result = resolve_and_lock(&project, false).await.unwrap();
+        assert_eq!(result, locked);
+        assert_eq!(project.load_lockfile().unwrap().unwrap(), locked);
     }
 
     fn git_dep(git: &str, rev: Option<&str>, subdirectory: Option<&str>) -> DependencySpec {

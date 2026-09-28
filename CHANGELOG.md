@@ -9,9 +9,11 @@ Pure tracking section — fixes and small features land here between tags.
 
 - **Frozen sync checks the manifest locally** (#305). New lockfiles record a
   fingerprint of resolution inputs, so upstream releases cannot make an
-  unchanged lock fail in CI. Older lockfiles get a local dependency check;
-  running `uvr lock` records the fingerprint. Plain `uvr lock` now keeps
-  compatible locked registry versions; use `--upgrade` to refresh them.
+  unchanged lock fail in CI. Graph completeness and development flags are also
+  checked. Older CRAN/Bioconductor locks get a local dependency check; older
+  Git/custom-repository locks need a one-time `uvr lock` migration. Plain
+  `uvr lock` reuses the entire resolution when its inputs match; changed inputs
+  trigger a fresh resolution. Use `--upgrade` to refresh unchanged inputs.
 - **Add and remove preserve comments and other tools' manifest metadata**
   (#306), including `[project] version` and `[tool.*]` tables.
 - **Git packages stay tied to their pinned source** (#300). Sync no longer

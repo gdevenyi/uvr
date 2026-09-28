@@ -145,7 +145,24 @@ fn copy_document_key(
     key: &str,
 ) {
     if let Some(item) = desired.get(section).and_then(|table| table.get(key)) {
-        doc[section][key] = item.clone();
+        let mut item = item.clone();
+        if let Some(old) = doc.get(section).and_then(|table| table.get(key)) {
+            // Keep an existing dependency on one line when changing a bare
+            // version into a detailed source declaration, including its note.
+            if old.is_value() {
+                if let Some(table) = item.as_table() {
+                    let mut inline = table.clone().into_inline_table();
+                    inline.fmt();
+                    item = toml_edit::Item::Value(toml_edit::Value::InlineTable(inline));
+                }
+            }
+            if let (Some(old), Some(new)) = (old.as_value(), item.as_value_mut()) {
+                *new.decor_mut() = old.decor().clone();
+            } else if let (Some(old), Some(new)) = (old.as_table(), item.as_table_mut()) {
+                *new.decor_mut() = old.decor().clone();
+            }
+        }
+        doc[section][key] = item;
     } else if let Some(table) = doc
         .get_mut(section)
         .and_then(|item| item.as_table_like_mut())
@@ -1525,6 +1542,40 @@ bioc = true
         manifest.write(&path).unwrap();
         let removed = std::fs::read_to_string(&path).unwrap();
         assert_eq!(removed, original);
+    }
+
+    #[test]
+    fn updating_a_dependency_preserves_its_inline_comment() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("uvr.toml");
+        std::fs::write(&path, "[project]\nname = \"test\"\n\n[dependencies]\n# needed by analysis\nrlang = \"*\" # keep this explanation\n").unwrap();
+        let mut manifest = Manifest::from_file(&path).unwrap();
+        manifest.add_dep(
+            "rlang".into(),
+            DependencySpec::Version(">=1.0".into()),
+            false,
+        );
+        manifest.write(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# needed by analysis"));
+        assert!(text.contains("rlang = \">=1.0\" # keep this explanation"));
+
+        manifest.add_dep(
+            "rlang".into(),
+            DependencySpec::Detailed(DetailedDep {
+                git: Some("r-lib/rlang".into()),
+                ..Default::default()
+            }),
+            false,
+        );
+        manifest.write(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# needed by analysis"));
+        assert!(text.contains("} # keep this explanation"));
+        assert_eq!(
+            Manifest::from_file(&path).unwrap().dependencies,
+            manifest.dependencies
+        );
     }
 
     #[test]

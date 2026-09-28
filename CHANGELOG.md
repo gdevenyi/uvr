@@ -19,6 +19,39 @@ Pure tracking section — fixes and small features land here between tags.
   byte-identical. `uvr init --bare` is the persistent form for interactive
   use: `uvr.toml`, `.uvr/library/`, and a protective `.gitignore`, persisted
   in `[project] bare = true`.
+
+- **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
+  installs** (#261). uvr skipped the shim for a system R on the assumption
+  that CRAN's framework build links `libomp` itself. It does not: `libR.dylib`
+  carries no `libomp` load command and `SHLIB_OPENMP_CFLAGS` is empty, so
+  P3M binaries built with `-fopenmp` that don't link the runtime by absolute
+  path (mgcv 1.9-4 among them, hence anything depending on it) failed with
+  `symbol not found in flat namespace '___kmpc_barrier'`, and the
+  unconditional `R_PROFILE_USER=/dev/null` at install time removed the
+  `.Rprofile` workaround too. Rather than editing an R it does not own, uvr
+  now writes its site profile to `~/.uvr/etc/Rprofile.site` and points
+  `R_PROFILE` at it per invocation, for `uvr run`, `uvr activate` (restored
+  on `deactivate`), and `R CMD INSTALL`'s child sessions. The profile first
+  sources the site profile it displaces (`$R_HOME/etc/Rprofile.site`, or a
+  user's own `R_PROFILE`, carried in `UVR_SITE_PROFILE_ORIG`), so nothing is
+  shadowed. Verified against a shim-less R: P3M's mgcv 1.9-4 fails before and
+  loads after, with the chained profile's options still visible. `R --vanilla`
+  remains the documented gap. Reported with a full `otool` diagnosis by
+  @remlapmot, with @gdevenyi confirming the install-time half from the code.
+
+- **`uvr r install` rewrites the stale build-time `R_HOME_DIR` in the
+  `bin/R` wrapper to the installation's real path** (#271). The portable
+  builds leave the build machine's path (a `/Library/Frameworks/...`
+  framework directory on macOS) on the wrapper's first assignment and only
+  recompute it at runtime, so tools that read the wrapper as text resolved
+  the interpreter to an R that isn't there — Positron either failed to
+  start uvr-managed R or silently launched a different version against the
+  project's library. The rewrite is inert for shell execution (the runtime
+  override recomputes the same value) and only corrects what static
+  readers see. Applies to new installs; refresh an existing version with
+  `uvr r uninstall <ver> && uvr r install <ver>`. Reported with a
+  verified one-line diagnosis by @Felixmil.
+
 - **GitHub dependencies can select an R package in a repository
   subdirectory, directly or through transitive DESCRIPTION `Remotes:`** (#244).
   Direct declarations use

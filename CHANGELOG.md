@@ -9,6 +9,11 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **`uvr scan` now detects `box::use()` imports.** Package declarations
+  (`box::use(dplyr[filter])`, `box::use(gg = ggplot2)`) are discovered;
+  local module paths (`box::use(./mod)`, `box::use(prefix/mod)`) are
+  ignored.
+
 - **Packages from any git host** (#190). A dependency can now name a git
   repository by its clone URL: `uvr add git::https://git.example.com/team/pkg.git@v1.0`,
   or `pkg = { git = "git::<url>", rev = "v1.0" }` in `uvr.toml`. This covers

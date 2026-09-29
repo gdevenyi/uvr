@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Result, UvrError};
 
@@ -138,6 +139,66 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn copy_document_key(
+    doc: &mut toml_edit::DocumentMut,
+    desired: &toml_edit::DocumentMut,
+    section: &str,
+    key: &str,
+) {
+    if let Some(item) = desired.get(section).and_then(|table| table.get(key)) {
+        let item = doc
+            .get(section)
+            .and_then(|table| table.get(key))
+            .map(|old| edited_item_preserving_comments(old, item))
+            .unwrap_or_else(|| item.clone());
+        doc[section][key] = item;
+    } else if let Some(table) = doc
+        .get_mut(section)
+        .and_then(|item| item.as_table_like_mut())
+    {
+        table.remove(key);
+    }
+}
+
+fn edited_item_preserving_comments(
+    old: &toml_edit::Item,
+    desired: &toml_edit::Item,
+) -> toml_edit::Item {
+    if let (Some(previous), Some(next)) = (old.as_table_like(), desired.as_table_like()) {
+        let mut item = old.clone();
+        let table = item.as_table_like_mut().expect("cloned table");
+        for (key, _) in previous.iter() {
+            if !next.contains_key(key) {
+                table.remove(key);
+            }
+        }
+        for (key, new) in next.iter() {
+            if let Some(current) = table.get_mut(key) {
+                *current = edited_item_preserving_comments(current, new);
+            } else {
+                table.insert(key, new.clone());
+            }
+        }
+        return item;
+    }
+    let mut item = desired.clone();
+    // Keep an existing dependency on one line when changing a bare version
+    // into a detailed source declaration, including its note.
+    if old.is_value() {
+        if let Some(table) = item.as_table() {
+            let mut inline = table.clone().into_inline_table();
+            inline.fmt();
+            item = toml_edit::Item::Value(toml_edit::Value::InlineTable(inline));
+        }
+    }
+    if let (Some(old), Some(new)) = (old.as_value(), item.as_value_mut()) {
+        *new.decor_mut() = old.decor().clone();
+    } else if let (Some(old), Some(new)) = (old.as_table(), item.as_table_mut()) {
+        *new.decor_mut() = old.decor().clone();
+    }
+    item
+}
+
 impl std::str::FromStr for Manifest {
     type Err = crate::error::UvrError;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -233,6 +294,20 @@ impl std::str::FromStr for Manifest {
 }
 
 impl Manifest {
+    /// Hash only fields that affect resolution, so comments and project
+    /// metadata can change without making a frozen lock stale.
+    pub fn lock_fingerprint(&self) -> Result<String> {
+        let mut inputs = self.clone();
+        inputs.project.name.clear();
+        inputs.project.description = None;
+        inputs.activate = None;
+        let canonical = toml::to_string(&inputs).map_err(UvrError::TomlSer)?;
+        Ok(format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(canonical.as_bytes()))
+        ))
+    }
+
     pub fn new(name: impl Into<String>, r_version: Option<String>) -> Self {
         Manifest {
             project: ProjectMeta {
@@ -389,8 +464,70 @@ impl Manifest {
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
-        let s = self.to_toml_string()?;
+        let s = if path.exists() {
+            self.write_preserving_existing(path)?
+        } else {
+            self.to_toml_string()?
+        };
         atomic_write(path, s.as_bytes())
+    }
+
+    /// Change only modeled fields that actually changed. Rebuilding the whole
+    /// document loses comments and metadata owned by other tools (#306).
+    fn write_preserving_existing(&self, path: &Path) -> Result<String> {
+        self.validate_detailed_dependencies()?;
+        let original = std::fs::read_to_string(path)?;
+        let previous: Manifest = original.parse()?;
+        let mut doc: toml_edit::DocumentMut = original
+            .parse()
+            .map_err(|e: toml_edit::TomlError| UvrError::ManifestParse(e.to_string()))?;
+        let desired = toml_edit::ser::to_document(self)
+            .map_err(|e| UvrError::Other(format!("Failed to serialize manifest: {e}")))?;
+
+        for (key, changed) in [
+            ("name", previous.project.name != self.project.name),
+            (
+                "r_version",
+                previous.project.r_version != self.project.r_version,
+            ),
+            (
+                "bioc_version",
+                previous.project.bioc_version != self.project.bioc_version,
+            ),
+            (
+                "description",
+                previous.project.description != self.project.description,
+            ),
+        ] {
+            if changed {
+                copy_document_key(&mut doc, &desired, "project", key);
+            }
+        }
+        for (section, old, new) in [
+            ("dependencies", &previous.dependencies, &self.dependencies),
+            (
+                "dev-dependencies",
+                &previous.dev_dependencies,
+                &self.dev_dependencies,
+            ),
+        ] {
+            for key in old.keys().chain(new.keys()) {
+                if old.get(key) != new.get(key) {
+                    copy_document_key(&mut doc, &desired, section, key);
+                }
+            }
+        }
+        if previous.sources != self.sources {
+            if let Some(item) = desired.get("sources") {
+                doc["sources"] = item.clone();
+            } else {
+                doc.remove("sources");
+            }
+        }
+        if previous.activate != self.activate {
+            copy_document_key(&mut doc, &desired, "activate", "prompt");
+        }
+        Ok(doc.to_string())
     }
 
     /// Add or update a dependency. Returns `true` if a new dep was added.
@@ -1416,6 +1553,78 @@ bioc = true
         ));
         assert!(m.remove_dep("ggplot2"));
         assert!(!m.remove_dep("ggplot2"));
+    }
+
+    #[test]
+    fn add_remove_preserves_comments_and_unmodeled_metadata() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("uvr.toml");
+        let original = "# project note\n[project]\nname = \"example\"\nversion = \"1.2.3\" # release marker\n\n[dependencies]\n# keep this note\nrlang = \"*\"\n\n[tool.release]\nchannel = \"stable\"\n";
+        std::fs::write(&path, original).unwrap();
+        let mut manifest = Manifest::from_file(&path).unwrap();
+        manifest.add_dep("ggplot2".into(), DependencySpec::Version("*".into()), false);
+        manifest.write(&path).unwrap();
+        let added = std::fs::read_to_string(&path).unwrap();
+        assert!(added.contains("# project note"));
+        assert!(added.contains("version = \"1.2.3\" # release marker"));
+        assert!(added.contains("# keep this note"));
+        assert!(added.contains("[tool.release]\nchannel = \"stable\""));
+        assert!(added.contains("ggplot2"));
+
+        manifest.remove_dep("ggplot2");
+        manifest.write(&path).unwrap();
+        let removed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(removed, original);
+    }
+
+    #[test]
+    fn updating_a_dependency_preserves_its_inline_comment() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("uvr.toml");
+        std::fs::write(&path, "[project]\nname = \"test\"\n\n[dependencies]\n# needed by analysis\nrlang = \"*\" # keep this explanation\n").unwrap();
+        let mut manifest = Manifest::from_file(&path).unwrap();
+        manifest.add_dep(
+            "rlang".into(),
+            DependencySpec::Version(">=1.0".into()),
+            false,
+        );
+        manifest.write(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# needed by analysis"));
+        assert!(text.contains("rlang = \">=1.0\" # keep this explanation"));
+
+        manifest.add_dep(
+            "rlang".into(),
+            DependencySpec::Detailed(DetailedDep {
+                git: Some("r-lib/rlang".into()),
+                ..Default::default()
+            }),
+            false,
+        );
+        manifest.write(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# needed by analysis"));
+        assert!(text.contains("} # keep this explanation"));
+        assert_eq!(
+            Manifest::from_file(&path).unwrap().dependencies,
+            manifest.dependencies
+        );
+    }
+
+    #[test]
+    fn updating_a_detailed_dependency_preserves_field_comments() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("uvr.toml");
+        std::fs::write(&path, "[project]\nname = \"test\"\n\n[dependencies.rlang]\ngit = \"r-lib/rlang\" # upstream\nrev = \"main\" # required for analysis\n").unwrap();
+        let mut manifest = Manifest::from_file(&path).unwrap();
+        let DependencySpec::Detailed(spec) = manifest.dependencies.get_mut("rlang").unwrap() else {
+            panic!("detailed dependency");
+        };
+        spec.rev = Some("v1.1.6".into());
+        manifest.write(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("git = \"r-lib/rlang\" # upstream"));
+        assert!(text.contains("rev = \"v1.1.6\" # required for analysis"));
     }
 
     #[test]

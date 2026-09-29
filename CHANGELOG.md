@@ -5,7 +5,7 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 ## Unreleased
 
-- Verify installed and cached generic Git package provenance before reuse, including same-version content or origin changes. Frozen sync now rejects changed pinned content.
+- Verify installed and cached generic Git package provenance before reuse, including same-version content or origin changes. Frozen sync validates manifest inputs locally and restores the locked commit without following remote branch changes.
 
 Pure tracking section — fixes and small features land here between tags.
 
@@ -51,6 +51,20 @@ Pure tracking section — fixes and small features land here between tags.
   repository. A `401`/`403` names the repository and the variables to set.
   Credentials never show in output, `-v` included, and `user:pass@` URLs are
   redacted. `uvr add --source` now refuses a URL that has credentials in it.
+
+- **Frozen sync checks the manifest locally** (#305). New lockfiles record a
+  fingerprint of resolution inputs, so upstream releases cannot make an
+  unchanged lock fail in CI. Graph completeness and development flags are also
+  checked. Older CRAN/Bioconductor locks get a local dependency check; older
+  Git/custom-repository locks need a one-time `uvr lock` migration. Plain
+  `uvr lock` reuses the entire resolution when its inputs match; changed inputs
+  trigger a fresh resolution. Use `--upgrade` to refresh unchanged inputs.
+- **Add and remove preserve comments and other tools' manifest metadata**
+  (#306), including `[project] version` and `[tool.*]` tables.
+- **Git packages stay tied to their pinned source** (#300). Sync no longer
+  substitutes a same-name registry binary for a GitHub, GitLab, or Forgejo
+  dependency, and it checks installed and cached packages against the commit.
+- **Distro suite maintenance:** refreshed the Alpine 3.21/3.22 image versions.
 
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption

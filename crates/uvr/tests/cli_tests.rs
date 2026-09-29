@@ -1441,7 +1441,7 @@ fn test_doctor_reports_git() {
     );
 }
 
-// The existing spec shapes are written as before (#190 regression).
+// Existing Git provider specs retain their meaning after manifest edits (#190).
 #[test]
 fn test_add_no_lock_keeps_every_git_spec_shape() {
     let dir = init_project("specshapes");
@@ -1457,14 +1457,19 @@ fn test_add_no_lock_keeps_every_git_spec_shape() {
         .current_dir(dir.path())
         .assert()
         .success();
-    let toml = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
-    for expected in [
-        "[dependencies.ghpkg]\ngit = \"owner/ghpkg\"\nrev = \"v1\"\n",
-        "[dependencies.fjpkg]\ngit = \"forgejo::codefloe.com/team/fjpkg\"\nrev = \"main\"\n",
-        "[dependencies.glpkg]\ngit = \"gitlab::gitlab.com/group/sub/glpkg\"\n",
-        "[dependencies.bbpkg]\ngit = \"git::git@bitbucket.org:team/bbpkg.git\"\nrev = \"v2\"\n",
+    let manifest = uvr_core::manifest::Manifest::from_file(&dir.path().join("uvr.toml")).unwrap();
+    for (name, git, rev) in [
+        ("ghpkg", "owner/ghpkg", Some("v1")),
+        ("fjpkg", "forgejo::codefloe.com/team/fjpkg", Some("main")),
+        ("glpkg", "gitlab::gitlab.com/group/sub/glpkg", None),
+        ("bbpkg", "git::git@bitbucket.org:team/bbpkg.git", Some("v2")),
     ] {
-        assert!(toml.contains(expected), "{expected}\n---\n{toml}");
+        let spec = &manifest.dependencies[name];
+        assert_eq!(spec.git(), Some(git), "{name}");
+        let uvr_core::manifest::DependencySpec::Detailed(dep) = spec else {
+            panic!("expected detailed dependency for {name}");
+        };
+        assert_eq!(dep.rev.as_deref(), rev, "{name}");
     }
 }
 

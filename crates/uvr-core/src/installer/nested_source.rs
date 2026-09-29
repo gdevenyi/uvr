@@ -25,7 +25,9 @@ impl NestedProvenance {
                 checksum: p.checksum.clone().unwrap_or_default(),
                 subdirectory: String::new(),
             };
-            if Self::parse(&provenance.to_file_contents()).as_ref() != Some(&provenance) {
+            if p.subdirectory.is_some()
+                || Self::parse(&provenance.to_file_contents()).as_ref() != Some(&provenance)
+            {
                 return Err(UvrError::Other(format!(
                     "Invalid pinned source identity for '{}'; run `uvr lock` to regenerate it",
                     p.name
@@ -33,14 +35,53 @@ impl NestedProvenance {
             }
             return Ok(Some(provenance));
         }
-        let Some(subdirectory) = p.subdirectory.as_deref() else {
-            return Ok(None);
+        let source = match &p.source {
+            crate::lockfile::PackageSource::GitHub => "github".to_string(),
+            crate::lockfile::PackageSource::Forgejo { host } => format!("forgejo:{host}"),
+            crate::lockfile::PackageSource::Gitlab { host } => format!("gitlab:{host}"),
+            _ => return Ok(None),
         };
+        let url = p.url.as_deref().unwrap_or_default();
+        let checksum = p.checksum.as_deref().unwrap_or_default();
+        if url.is_empty()
+            || !checksum
+                .strip_prefix("git:")
+                .is_some_and(crate::registry::github::is_full_commit_sha)
+        {
+            return Err(UvrError::Other(format!(
+                "Git package {} has no valid pinned URL and commit in uvr.lock; run `uvr lock`",
+                p.name
+            )));
+        }
+        let commit = checksum.strip_prefix("git:").unwrap_or_default();
+        let matches_commit = match &p.source {
+            crate::lockfile::PackageSource::Forgejo { host } => {
+                url.strip_prefix(&format!("https://{host}/api/v1/repos/"))
+                    .is_some_and(|path| {
+                        let parts: Vec<_> = path.split('/').collect();
+                        matches!(parts.as_slice(), [owner, repo, "archive", archive]
+                            if !owner.is_empty() && !repo.is_empty() && *archive == format!("{commit}.tar.gz"))
+                    })
+            }
+            crate::lockfile::PackageSource::Gitlab { host } => {
+                url.strip_prefix(&format!("https://{host}/api/v4/projects/"))
+                    .and_then(|path| path.split_once("/repository/archive.tar.gz?sha="))
+                    .is_some_and(|(project, sha)| !project.is_empty() && !project.contains(['/', '?', '#']) && sha == commit)
+            }
+            // GitHub's canonical URL/commit pair was validated above.
+            _ => true,
+        };
+        if !matches_commit {
+            return Err(UvrError::Other(format!(
+                "Git package {} has an archive URL that does not match its pinned source and commit; run `uvr lock`",
+                p.name
+            )));
+        }
         Ok(Some(NestedProvenance {
-            source: "github".to_string(),
-            url: p.url.clone().unwrap_or_default(),
-            checksum: p.checksum.clone().unwrap_or_default(),
-            subdirectory: subdirectory.to_string(),
+            source,
+            url: url.to_string(),
+            checksum: checksum.to_string(),
+            subdirectory: p.subdirectory.clone().unwrap_or_default(),
         }))
     }
 
@@ -88,8 +129,12 @@ impl NestedProvenance {
             })
         };
         let valid = match source.as_str() {
-            "github" => {
-                crate::subdirectory::is_valid(&subdirectory)
+            source
+                if source == "github"
+                    || source.starts_with("forgejo:")
+                    || source.starts_with("gitlab:") =>
+            {
+                (subdirectory.is_empty() || crate::subdirectory::is_valid(&subdirectory))
                     && checksum
                         .strip_prefix("git:")
                         .is_some_and(crate::registry::github::is_full_commit_sha)
@@ -396,6 +441,44 @@ mod tests {
         root.checksum = Some("md5:abc".to_string());
         root.url = Some("https://cran.r-project.org/x.tar.gz".to_string());
         assert_eq!(NestedProvenance::from_locked(&root).unwrap(), None);
+    }
+
+    #[test]
+    fn root_git_package_requires_matching_commit_marker() {
+        let temp = TempDir::new().unwrap();
+        let package = make_pkg_dir(temp.path(), "rlang", "rlang");
+        for source in [
+            PackageSource::GitHub,
+            PackageSource::Gitlab {
+                host: "gitlab.com".into(),
+            },
+            PackageSource::Forgejo {
+                host: "code.example".into(),
+            },
+        ] {
+            let mut pkg = locked(SHA, None);
+            pkg.source = source;
+            pkg.url = Some(match &pkg.source {
+                PackageSource::Gitlab { host } => format!(
+                    "https://{host}/api/v4/projects/o%2Fr/repository/archive.tar.gz?sha={SHA}"
+                ),
+                PackageSource::Forgejo { host } => {
+                    format!("https://{host}/api/v1/repos/o/r/archive/{SHA}.tar.gz")
+                }
+                _ => url_for(SHA),
+            });
+            let expected = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
+            assert!(!provenance_matches(&package, Some(&expected)));
+            write_marker(&package, &expected).unwrap();
+            assert!(provenance_matches(&package, Some(&expected)));
+            let other = NestedProvenance::from_locked(&locked(OTHER_SHA, None))
+                .unwrap()
+                .unwrap();
+            assert!(!provenance_matches(&package, Some(&other)));
+            pkg.checksum = Some(format!("git:{OTHER_SHA}"));
+            assert!(NestedProvenance::from_locked(&pkg).is_err());
+            clear_marker(&package).unwrap();
+        }
     }
 
     #[test]

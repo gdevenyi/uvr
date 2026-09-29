@@ -2547,6 +2547,7 @@ name = "uvr-core"
 version = "0.4.6"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "console",
  "dirs",

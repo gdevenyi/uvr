@@ -139,6 +139,11 @@ impl NestedProvenance {
                         .strip_prefix("git:")
                         .is_some_and(crate::registry::github::is_full_commit_sha)
             }
+            "git" => {
+                subdirectory.is_empty()
+                    && crate::registry::git_generic::validate_url(&url).is_ok()
+                    && hex("git:", &[40, 64])
+            }
             "url" => {
                 subdirectory.is_empty()
                     && crate::registry::url::is_source_tarball_url(&url)
@@ -160,6 +165,7 @@ impl NestedProvenance {
 
 fn pinned_source(p: &LockedPackage) -> Option<(&str, &str)> {
     match &p.source {
+        crate::lockfile::PackageSource::Git { url } => Some(("git", url)),
         crate::lockfile::PackageSource::Url => Some(("url", p.url.as_deref().unwrap_or_default())),
         _ => None,
     }

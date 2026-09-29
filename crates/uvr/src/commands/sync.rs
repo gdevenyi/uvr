@@ -68,6 +68,7 @@ fn is_repository_archive(pkg: &LockedPackage) -> bool {
             uvr_core::lockfile::PackageSource::GitHub
                 | uvr_core::lockfile::PackageSource::Forgejo { .. }
                 | uvr_core::lockfile::PackageSource::Gitlab { .. }
+                | uvr_core::lockfile::PackageSource::Git { .. }
         )
 }
 
@@ -186,7 +187,7 @@ async fn fetch_custom_registries(
                 tracing::warn!(
                     "Failed to fetch custom source '{}' ({}): {e}; treating as non-binary-capable",
                     src.name,
-                    src.url,
+                    uvr_core::auth::redact_url(&src.url),
                 );
             }
         }
@@ -741,25 +742,26 @@ async fn install_from_lockfile_with_r(
         _ => None,
     };
 
+    // Sync-time only: UVR_REPOS env-injected sources are added here so a
+    // CI runner can swap binary mirrors at install time without changing
+    // uvr.toml or contaminating uvr.lock. Lock-time (lock.rs) only sees
+    // uvr.toml's [[sources]], so the lockfile stays reproducible across
+    // environments.
+    let env_repos = uvr_core::env_vars::repos().unwrap_or_default();
+    let combined_sources: Vec<uvr_core::manifest::PackageSource> = env_repos
+        .iter()
+        .map(|r| uvr_core::manifest::PackageSource {
+            name: r.name.clone(),
+            url: r.url.clone(),
+        })
+        .chain(project.manifest.sources.iter().cloned())
+        .collect();
+
     let plans: Vec<PkgPlan> = if !cache_misses.is_empty() {
         // Re-fetch each [[sources]] (HTTP-cached → 304 normally) and partition
         // into binary-capable vs. source-only. A registry is "binary-capable"
         // when at least one of its PACKAGES entries has a Built: line that
         // matches the running host triple + R minor.
-        // Sync-time only: UVR_REPOS env-injected sources are added here so a
-        // CI runner can swap binary mirrors at install time without changing
-        // uvr.toml or contaminating uvr.lock. Lock-time (lock.rs) only sees
-        // uvr.toml's [[sources]], so the lockfile stays reproducible across
-        // environments.
-        let env_repos = uvr_core::env_vars::repos().unwrap_or_default();
-        let combined_sources: Vec<uvr_core::manifest::PackageSource> = env_repos
-            .iter()
-            .map(|r| uvr_core::manifest::PackageSource {
-                name: r.name.clone(),
-                url: r.url.clone(),
-            })
-            .chain(project.manifest.sources.iter().cloned())
-            .collect();
         let custom_registries =
             fetch_custom_registries(&client, &combined_sources, Some(user_agent.as_str())).await;
         let custom_binary: Vec<&uvr_core::registry::cran::CranRegistry> = custom_registries
@@ -803,7 +805,7 @@ async fn install_from_lockfile_with_r(
             if tracing::event_enabled!(tracing::Level::DEBUG) {
                 for reg in &custom_binary {
                     let (name, base) = reg.name_and_base();
-                    ui::bullet_dim(format!("{name} ({base})"));
+                    ui::bullet_dim(format!("{name} ({})", uvr_core::auth::redact_url(base)));
                 }
             }
             None
@@ -840,30 +842,12 @@ async fn install_from_lockfile_with_r(
     let mut runtime_source = 0usize;
 
     if !plans.is_empty() {
-        // Forgejo/GitLab tarballs (the lockfile `url` field for those
-        // sources) require the registry-scoped token to download from
-        // private repos/projects. The lock phase already attaches it to
-        // API calls; sync needs to attach it to the archive download too.
-        // github tarballs go through api.github.com which works
-        // unauthenticated for public repos and GitHub doesn't accept the
-        // same env-var convention here — no auth forwarding needed.
-        let auth_headers: Vec<Option<String>> = plans
-            .iter()
-            .map(|p| match &p.pkg.source {
-                uvr_core::lockfile::PackageSource::Forgejo { host } => {
-                    uvr_core::registry::forgejo::forgejo_token(host).map(|t| format!("token {t}"))
-                }
-                uvr_core::lockfile::PackageSource::Gitlab { host } => {
-                    uvr_core::registry::gitlab::gitlab_token(host).map(|t| format!("Bearer {t}"))
-                }
-                _ => None,
-            })
-            .collect();
-
+        // GitHub/GitLab/Forgejo tarballs of private repositories need the
+        // host's token. The Downloader takes it from the package source and
+        // sends it only to URLs on that host (#187).
         let specs: Vec<DownloadSpec> = plans
             .iter()
-            .zip(auth_headers.iter())
-            .map(|(p, auth)| DownloadSpec {
+            .map(|p| DownloadSpec {
                 pkg: p.pkg,
                 url: &p.url,
                 fallback_url: p.fallback_url.as_deref(),
@@ -879,13 +863,19 @@ async fn install_from_lockfile_with_r(
                 } else {
                     None
                 },
-                auth_header: auth.as_deref(),
             })
             .collect();
 
         // Cloned rather than moved: the sysreqs check below still needs the
         // client, and it now runs after the download phase (#207).
-        let downloader = Downloader::new(client.clone(), cache_dir, jobs);
+        // Each [[sources]] repository's env credential (#185), sent only to
+        // URLs under that repository.
+        let repositories = combined_sources
+            .iter()
+            .map(|s| uvr_core::auth::Repository::new(&s.name, &s.url))
+            .collect();
+        let downloader =
+            Downloader::new(client.clone(), cache_dir, jobs).with_repositories(repositories);
         let results = downloader
             .download_all(&specs)
             .await
@@ -976,8 +966,10 @@ async fn install_from_lockfile_with_r(
                     &plan.url
                 };
                 ui::bullet_dim(format!(
-                    "{} {} — {kind_label} — {url}",
-                    plan.pkg.name, plan.pkg.version
+                    "{} {} — {kind_label} — {}",
+                    plan.pkg.name,
+                    plan.pkg.version,
+                    uvr_core::auth::redact_url(url)
                 ));
             }
         }
@@ -1724,6 +1716,7 @@ pub(super) fn validate_frozen_lock(project: &Project, lockfile: &Lockfile) -> Re
                             | uvr_core::lockfile::PackageSource::Forgejo { .. }
                             | uvr_core::lockfile::PackageSource::Gitlab { .. }
                             | uvr_core::lockfile::PackageSource::Custom { .. }
+                            | uvr_core::lockfile::PackageSource::Git { .. }
                             | uvr_core::lockfile::PackageSource::Url
                     )
                 })
@@ -1829,7 +1822,9 @@ fn validate_locked_manifest(project: &Project, lockfile: &Lockfile) -> Result<()
             anyhow::bail!("Locked URL source for {name} is not declared in the manifest");
         }
         if let Some(git) = spec.git() {
-            let matching_provider = if git.starts_with("forgejo::") {
+            let matching_provider = if let Some(url) = git.strip_prefix("git::") {
+                matches!(&pkg.source, uvr_core::lockfile::PackageSource::Git { url: locked } if locked == url)
+            } else if git.starts_with("forgejo::") {
                 matches!(
                     pkg.source,
                     uvr_core::lockfile::PackageSource::Forgejo { .. }
@@ -1852,6 +1847,7 @@ fn validate_locked_manifest(project: &Project, lockfile: &Lockfile) -> Result<()
             uvr_core::lockfile::PackageSource::GitHub
                 | uvr_core::lockfile::PackageSource::Forgejo { .. }
                 | uvr_core::lockfile::PackageSource::Gitlab { .. }
+                | uvr_core::lockfile::PackageSource::Git { .. }
         ) {
             anyhow::bail!("Locked Git source for {name} is not declared in the manifest");
         }
@@ -2421,7 +2417,7 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
     }
     let ver = pkg.raw_version.as_deref().unwrap_or(&pkg.version);
     use uvr_core::lockfile::PackageSource;
-    match pkg.source {
+    match &pkg.source {
         PackageSource::Cran => format!(
             "https://cran.r-project.org/src/contrib/{}_{}.tar.gz",
             pkg.name, ver
@@ -2444,6 +2440,9 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
         | PackageSource::GitHub
         | PackageSource::Url
         | PackageSource::Local => String::new(),
+        // A `git::` package locks no `url`: the downloader fetches the
+        // locked commit from the clone URL (#190).
+        PackageSource::Git { url } => url.clone(),
         PackageSource::Custom { .. } => {
             // Custom repo packages should always have a stored URL from resolution.
             // Fall back to empty if somehow missing.
@@ -3229,6 +3228,33 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(msg.contains("Checksum mismatch for cli"), "{msg}");
     }
 
+    // #190: a `git::` package installs from its commit, even when a
+    // binary repository has a package of the same name and version.
+    #[test]
+    fn select_plan_forces_source_for_a_git_package() {
+        let url = "https://git.corp.example/team/rlang.git";
+        let pkg = LockedPackage {
+            source: PackageSource::Git { url: url.into() },
+            url: None,
+            ..nested_locked("rlang", NESTED_SHA, None)
+        };
+        let reg = CranRegistry::for_test(
+            parse_packages_gz(rlang_musl_packages()).unwrap(),
+            "https://rpkgs.example.com/src/contrib".into(),
+        );
+        // GitHub also retains its pinned source after #307.
+        let github = nested_locked("rlang", NESTED_SHA, None);
+        let plan = select_pkg_plan(&github, &[&reg], None, &musl_host(), "4.5", None);
+        assert!(!plan.is_binary);
+        assert_eq!(Some(plan.url.as_str()), github.url.as_deref());
+
+        let plan = select_pkg_plan(&pkg, &[&reg], None, &musl_host(), "4.5", None);
+        assert!(!plan.is_binary);
+        assert_eq!(plan.url, url);
+        assert!(plan.fallback_url.is_none());
+        assert_eq!(source_url(&pkg, None), url);
+    }
+
     #[test]
     fn select_plan_uses_pinned_archive_for_root_git_packages() {
         let reg = CranRegistry::for_test(
@@ -3262,6 +3288,9 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
             },
             PackageSource::Forgejo {
                 host: "code.example".into(),
+            },
+            PackageSource::Git {
+                url: "https://api.github.com/repos/o/r/tarball/0123456789abcdef0123456789abcdef01234567".into(),
             },
         ] {
             let mut pkg = nested_locked("rlang", NESTED_SHA, None);
@@ -3445,6 +3474,149 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
 
 #[cfg(test)]
 mod pinned_source_tests {
+    use super::*;
+    use uvr_core::lockfile::{PackageSource, RVersionPin};
+
+    fn package() -> LockedPackage {
+        LockedPackage {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            raw_version: None,
+            source: PackageSource::Git {
+                url: "https://example.org/demo.git".into(),
+            },
+            url: None,
+            checksum: Some(format!("git:{}", "a".repeat(40))),
+            subdirectory: None,
+            requires: vec![],
+            system_requirements: None,
+            dev: false,
+        }
+    }
+
+    #[test]
+    fn installed_pinned_source_requires_matching_content_and_origin() {
+        let lib = tempfile::tempdir().unwrap();
+        let dir = lib.path().join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("DESCRIPTION"), "Package: demo\nVersion: 1.0.0\n").unwrap();
+        let pkg = package();
+        assert!(
+            !is_installed(&pkg, lib.path()),
+            "old unmarked installs must be rebuilt"
+        );
+        let provenance = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
+        nested_source::write_marker(&dir, &provenance).unwrap();
+        assert!(
+            is_installed(&pkg, lib.path()),
+            "unchanged pinned code can be reused"
+        );
+        let mut other = pkg.clone();
+        other.checksum = Some(format!("git:{}", "b".repeat(40)));
+        assert!(
+            !is_installed(&other, lib.path()),
+            "same version, different content"
+        );
+        other = pkg.clone();
+        other.source = PackageSource::Git {
+            url: "https://example.org/other.git".into(),
+        };
+        assert!(
+            !is_installed(&other, lib.path()),
+            "same bytes, different source"
+        );
+        other = pkg.clone();
+        other.source = PackageSource::Cran;
+        assert!(
+            !is_installed(&other, lib.path()),
+            "switching back to a registry must rebuild"
+        );
+        std::fs::write(nested_source::marker_path(&dir), "invalid marker").unwrap();
+        assert!(!is_installed(&pkg, lib.path()));
+    }
+
+    #[test]
+    fn frozen_generic_git_checks_inputs_and_keeps_the_locked_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest: uvr_core::manifest::Manifest =
+            "[project]\nname = \"test\"\n[dependencies]\ndemo = { git = \"git::https://example.org/demo.git\", rev = \"main\" }\n"
+            .parse().unwrap();
+        manifest.write(&tmp.path().join("uvr.toml")).unwrap();
+        let mut project = Project::find(tmp.path()).unwrap();
+        let mut lock = Lockfile {
+            manifest_fingerprint: Some(manifest.lock_fingerprint().unwrap()),
+            r: RVersionPin::default(),
+            packages: vec![package()],
+        };
+        validate_frozen_lock(&project, &lock).unwrap();
+        lock.manifest_fingerprint = None;
+        assert!(validate_frozen_lock(&project, &lock).is_err());
+        lock.manifest_fingerprint = Some(manifest.lock_fingerprint().unwrap());
+        lock.packages[0].source = PackageSource::Git {
+            url: "https://example.org/other.git".into(),
+        };
+        assert!(validate_frozen_lock(&project, &lock).is_err());
+        lock.packages[0] = package();
+        if let Some(uvr_core::manifest::DependencySpec::Detailed(d)) =
+            project.manifest.dependencies.get_mut("demo")
+        {
+            d.rev = Some("other".into());
+        }
+        assert!(validate_frozen_lock(&project, &lock).is_err());
+    }
+
+    #[test]
+    fn malformed_pinned_identity_is_rejected_before_installation() {
+        let mut pkg = package();
+        for bad in [
+            None,
+            Some("".into()),
+            Some("sha256:short".into()),
+            Some("git:short".into()),
+        ] {
+            pkg.checksum = bad;
+            assert!(validate_lock_identity(&Lockfile {
+                manifest_fingerprint: None,
+                r: RVersionPin::default(),
+                packages: vec![pkg.clone()]
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn cache_attachment_preserves_pinned_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = tmp.path().join("cached/demo");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::write(
+            cached.join("DESCRIPTION"),
+            "Package: demo\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        let pkg = package();
+        let provenance = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
+        nested_source::write_marker(&cached, &provenance).unwrap();
+        let library = tmp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        package_cache::clone_to_library(&cached, &library, "demo").unwrap();
+        assert!(is_installed(&pkg, &library));
+        let mut changed = pkg;
+        changed.source = PackageSource::Git {
+            url: "https://example.org/changed.git".into(),
+        };
+        let different = NestedProvenance::from_locked(&changed).unwrap().unwrap();
+        assert_ne!(provenance.cache_identity(), different.cache_identity());
+        assert!(!nested_source::provenance_matches(
+            &cached,
+            Some(&different)
+        ));
+        assert!(!is_installed(&changed, &library));
+    }
+}
+
+#[cfg(test)]
+mod pinned_url_source_tests {
     use super::*;
     use uvr_core::lockfile::{PackageSource, RVersionPin};
 

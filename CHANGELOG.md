@@ -51,6 +51,17 @@ Pure tracking section — fixes and small features land here between tags.
   repository. A `401`/`403` names the repository and the variables to set.
   Credentials never show in output, `-v` included, and `user:pass@` URLs are
   redacted. `uvr add --source` now refuses a URL that has credentials in it.
+- Verify installed and cached URL tarball package provenance before reuse, including same-version content or origin changes. Downloads are verified against the locked checksum; frozen sync checks the declared URL locally.
+
+
+- **Depend on a source tarball by URL** (#189). `uvr add
+  https://…/pkg_1.2.0.tar.gz` records `pkg = { url = "…" }` in `uvr.toml`;
+  the lockfile pins the URL and a `sha256` checksum (`source = "url"`), and
+  `uvr sync` installs that exact file from source, never a same-named binary.
+  If the file changes, sync fails with both checksums and asks you to run
+  `uvr lock`. A URL that is not an R source package (a web page, a built
+  binary, a tarball without one top-level package directory) is rejected
+  when you add or lock it. `uvr export` writes these as renv `URL` remotes.
 
 - **Frozen sync checks the manifest locally** (#305). New lockfiles record a
   fingerprint of resolution inputs, so upstream releases cannot make an

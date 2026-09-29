@@ -124,7 +124,7 @@ fn select_pkg_plan<'a>(
 
     // A Git repository's pinned commit cannot be substituted with a registry
     // binary just because the package name and version happen to match.
-    if is_repository_archive(p) {
+    if is_repository_archive(p) || p.source == uvr_core::lockfile::PackageSource::Url {
         return PkgPlan {
             pkg: p,
             url: source_url_str,
@@ -879,6 +879,7 @@ async fn install_from_lockfile_with_r(
         let results = downloader
             .download_all(&specs)
             .await
+            .map_err(|e| explain_url_checksum_mismatch(e, &plans))
             .context("Download failed")?;
 
         // Phase: pre-sniff every downloaded tarball so the upfront message and
@@ -1716,6 +1717,7 @@ pub(super) fn validate_frozen_lock(project: &Project, lockfile: &Lockfile) -> Re
                             | uvr_core::lockfile::PackageSource::Gitlab { .. }
                             | uvr_core::lockfile::PackageSource::Custom { .. }
                             | uvr_core::lockfile::PackageSource::Git { .. }
+                            | uvr_core::lockfile::PackageSource::Url
                     )
                 })
             {
@@ -1807,6 +1809,17 @@ fn validate_locked_manifest(project: &Project, lockfile: &Lockfile) -> Result<()
             if !version_matches_req(&version, &parse_version_req(req)?) {
                 anyhow::bail!("Locked {} {} does not satisfy {req}", name, pkg.version);
             }
+        }
+        if let Some(url) = spec.url() {
+            if pkg.source != uvr_core::lockfile::PackageSource::Url
+                || pkg.url.as_deref() != Some(url)
+            {
+                anyhow::bail!(
+                    "Locked URL source for {name} differs from the manifest; run `uvr lock`"
+                );
+            }
+        } else if pkg.source == uvr_core::lockfile::PackageSource::Url {
+            anyhow::bail!("Locked URL source for {name} is not declared in the manifest");
         }
         if let Some(git) = spec.git() {
             let matching_provider = if let Some(url) = git.strip_prefix("git::") {
@@ -2367,6 +2380,33 @@ fn write_library_r_sentinel(library: &std::path::Path, minor: &str) {
     let _ = std::fs::write(library_sentinel_path(library), format!("{minor}\n"));
 }
 
+/// A URL dependency whose file no longer matches uvr.lock (#189): name the
+/// URL and say how to accept the change. Other errors pass through.
+fn explain_url_checksum_mismatch(
+    e: uvr_core::error::UvrError,
+    plans: &[PkgPlan<'_>],
+) -> anyhow::Error {
+    if let uvr_core::error::UvrError::ChecksumMismatch {
+        package,
+        expected,
+        actual,
+    } = &e
+    {
+        let url_plan = plans.iter().find(|p| {
+            p.pkg.name == *package && p.pkg.source == uvr_core::lockfile::PackageSource::Url
+        });
+        if let Some(plan) = url_plan {
+            return anyhow::anyhow!(
+                "Checksum mismatch for {package}: the file at {url} is {actual}, but uvr.lock \
+                 records {expected}. The file changed since it was locked; run `uvr lock` if \
+                 the change is expected.",
+                url = plan.url
+            );
+        }
+    }
+    e.into()
+}
+
 /// Return the source download URL for a locked package.
 /// Prefers the stored `url` field; falls back to reconstructing it.
 /// Uses `raw_version` (e.g. `"1.1-3"`) when available so the reconstructed
@@ -2389,7 +2429,7 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
                 pkg.name, ver
             )
         }
-        // Forgejo, GitLab, GitHub, and Local always have `url` populated by
+        // Forgejo, GitLab, GitHub, URL, and Local always have `url` populated by
         // the resolver (or are file:// paths handled elsewhere); the
         // `if let Some(url) ...` guard at the top of this function takes
         // the URL straight from `pkg.url`. If we reach this arm with no
@@ -2398,6 +2438,7 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
         PackageSource::Forgejo { .. }
         | PackageSource::Gitlab { .. }
         | PackageSource::GitHub
+        | PackageSource::Url
         | PackageSource::Local => String::new(),
         // A `git::` package locks no `url`: the downloader fetches the
         // locked commit from the clone URL (#190).
@@ -3122,6 +3163,71 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
         assert!(plan.fallback_url.is_none());
     }
 
+    fn url_locked() -> LockedPackage {
+        LockedPackage {
+            source: PackageSource::Url,
+            checksum: Some(format!("sha256:{}", "ab".repeat(32))),
+            ..locked_pkg("rlang", "1.1.6", "https://example.org/rlang_1.1.6.tar.gz")
+        }
+    }
+
+    #[test]
+    fn select_plan_forces_source_for_a_url_package() {
+        // #189: the custom repo (and P3M) have a same-name, same-version
+        // binary; the URL package must still install from its own tarball.
+        let pkg = url_locked();
+        let reg = CranRegistry::for_test(
+            parse_packages_gz(rlang_musl_packages()).unwrap(),
+            "https://rpkgs.example.com/src/contrib".into(),
+        );
+        let plan = select_pkg_plan(&pkg, &[&reg], None, &musl_host(), "4.5", None);
+        assert!(!plan.is_binary);
+        assert_eq!(plan.url, "https://example.org/rlang_1.1.6.tar.gz");
+        assert!(plan.fallback_url.is_none());
+    }
+
+    #[test]
+    fn url_checksum_mismatch_names_the_url_and_the_fix() {
+        let pkg = url_locked();
+        let plans = [PkgPlan {
+            pkg: &pkg,
+            url: pkg.url.clone().unwrap(),
+            fallback_url: None,
+            is_binary: false,
+        }];
+        let mismatch = |package: &str| uvr_core::error::UvrError::ChecksumMismatch {
+            package: package.into(),
+            expected: "sha256:old".into(),
+            actual: "sha256:new".into(),
+        };
+
+        let msg = explain_url_checksum_mismatch(mismatch("rlang"), &plans).to_string();
+        for needle in [
+            "https://example.org/rlang_1.1.6.tar.gz",
+            "sha256:old",
+            "sha256:new",
+            "run `uvr lock` if the change is expected",
+        ] {
+            assert!(msg.contains(needle), "missing {needle}: {msg}");
+        }
+
+        // A registry package keeps the plain error.
+        let cran = locked_pkg(
+            "cli",
+            "3.6.0",
+            "https://cran.r-project.org/cli_3.6.0.tar.gz",
+        );
+        let cran_plans = [PkgPlan {
+            pkg: &cran,
+            url: cran.url.clone().unwrap(),
+            fallback_url: None,
+            is_binary: false,
+        }];
+        let msg = explain_url_checksum_mismatch(mismatch("cli"), &cran_plans).to_string();
+        assert!(!msg.contains("uvr lock"), "{msg}");
+        assert!(msg.contains("Checksum mismatch for cli"), "{msg}");
+    }
+
     // #190: a `git::` package installs from its commit, even when a
     // binary repository has a package of the same name and version.
     #[test]
@@ -3198,6 +3304,39 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
                 InstallKind::Source
             );
         }
+    }
+
+    #[test]
+    fn frozen_url_lock_checks_origin_locally_and_requires_legacy_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = "https://example.org/a/rlang_1.1.6.tar.gz";
+        let b = "https://example.org/b/rlang_1.1.6.tar.gz";
+        let manifest: uvr_core::manifest::Manifest =
+            format!("[project]\nname = \"test\"\n[dependencies]\nrlang = {{ url = \"{a}\" }}\n")
+                .parse()
+                .unwrap();
+        manifest.write(&tmp.path().join("uvr.toml")).unwrap();
+        let mut project = Project::find(tmp.path()).unwrap();
+        let mut lock = Lockfile {
+            manifest_fingerprint: Some(manifest.lock_fingerprint().unwrap()),
+            r: RVersionPin::default(),
+            packages: vec![url_locked()],
+        };
+        lock.packages[0].url = Some(a.into());
+        lock.packages[0].checksum = Some(format!("sha256:{}", "a".repeat(64)));
+        validate_frozen_lock(&project, &lock).unwrap();
+        lock.manifest_fingerprint = None;
+        assert!(validate_frozen_lock(&project, &lock).is_err());
+        lock.manifest_fingerprint = Some(manifest.lock_fingerprint().unwrap());
+        lock.packages[0].url = Some(b.into());
+        assert!(validate_frozen_lock(&project, &lock).is_err());
+        lock.packages[0].url = Some(a.into());
+        if let Some(uvr_core::manifest::DependencySpec::Detailed(d)) =
+            project.manifest.dependencies.get_mut("rlang")
+        {
+            d.url = Some(b.into());
+        }
+        assert!(validate_frozen_lock(&project, &lock).is_err());
     }
 
     #[test]
@@ -3466,6 +3605,113 @@ mod pinned_source_tests {
         changed.source = PackageSource::Git {
             url: "https://example.org/changed.git".into(),
         };
+        let different = NestedProvenance::from_locked(&changed).unwrap().unwrap();
+        assert_ne!(provenance.cache_identity(), different.cache_identity());
+        assert!(!nested_source::provenance_matches(
+            &cached,
+            Some(&different)
+        ));
+        assert!(!is_installed(&changed, &library));
+    }
+}
+
+#[cfg(test)]
+mod pinned_url_source_tests {
+    use super::*;
+    use uvr_core::lockfile::{PackageSource, RVersionPin};
+
+    fn package() -> LockedPackage {
+        LockedPackage {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            raw_version: None,
+            source: PackageSource::Url,
+            url: Some("https://example.org/demo_1.0.0.tar.gz".into()),
+            checksum: Some(format!("sha256:{}", "a".repeat(64))),
+            subdirectory: None,
+            requires: vec![],
+            system_requirements: None,
+            dev: false,
+        }
+    }
+
+    #[test]
+    fn installed_pinned_source_requires_matching_content_and_origin() {
+        let lib = tempfile::tempdir().unwrap();
+        let dir = lib.path().join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("DESCRIPTION"), "Package: demo\nVersion: 1.0.0\n").unwrap();
+        let pkg = package();
+        assert!(
+            !is_installed(&pkg, lib.path()),
+            "old unmarked installs must be rebuilt"
+        );
+        let provenance = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
+        nested_source::write_marker(&dir, &provenance).unwrap();
+        assert!(
+            is_installed(&pkg, lib.path()),
+            "unchanged pinned code can be reused"
+        );
+        let mut other = pkg.clone();
+        other.checksum = Some(format!("sha256:{}", "b".repeat(64)));
+        assert!(
+            !is_installed(&other, lib.path()),
+            "same version, different content"
+        );
+        other = pkg.clone();
+        other.url = Some("https://example.org/other/demo_1.0.0.tar.gz".into());
+        assert!(
+            !is_installed(&other, lib.path()),
+            "same bytes, different source"
+        );
+        other = pkg.clone();
+        other.source = PackageSource::Cran;
+        assert!(
+            !is_installed(&other, lib.path()),
+            "switching back to a registry must rebuild"
+        );
+        std::fs::write(nested_source::marker_path(&dir), "invalid marker").unwrap();
+        assert!(!is_installed(&pkg, lib.path()));
+    }
+
+    #[test]
+    fn malformed_pinned_identity_is_rejected_before_installation() {
+        let mut pkg = package();
+        for bad in [
+            None,
+            Some("".into()),
+            Some("sha256:short".into()),
+            Some("git:short".into()),
+        ] {
+            pkg.checksum = bad;
+            assert!(validate_lock_identity(&Lockfile {
+                manifest_fingerprint: None,
+                r: RVersionPin::default(),
+                packages: vec![pkg.clone()]
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn cache_attachment_preserves_pinned_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = tmp.path().join("cached/demo");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::write(
+            cached.join("DESCRIPTION"),
+            "Package: demo\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        let pkg = package();
+        let provenance = NestedProvenance::from_locked(&pkg).unwrap().unwrap();
+        nested_source::write_marker(&cached, &provenance).unwrap();
+        let library = tmp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        package_cache::clone_to_library(&cached, &library, "demo").unwrap();
+        assert!(is_installed(&pkg, &library));
+        let mut changed = pkg;
+        changed.url = Some("https://example.org/other/demo_1.0.0.tar.gz".into());
         let different = NestedProvenance::from_locked(&changed).unwrap().unwrap();
         assert_ne!(provenance.cache_identity(), different.cache_identity());
         assert!(!nested_source::provenance_matches(

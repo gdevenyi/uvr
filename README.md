@@ -222,6 +222,7 @@ uvr add tidymodels@>=1.0.0
 uvr add user/repo@main
 uvr add 'user/monorepo@main#subdirectory=packages/nestedPkg'
 uvr add git::https://git.example.com/team/anyPkg.git@v1.0   # any git host
+uvr add https://example.org/builds/mypkg_1.2.0.tar.gz
 
 # Install everything from the lockfile
 uvr sync
@@ -467,10 +468,23 @@ DESeq2 = { bioc = true }
 myPkg = { git = "user/repo", rev = "main" }
 nestedPkg = { git = "user/monorepo", rev = "main", subdirectory = "packages/nestedPkg" }
 anyPkg = { git = "git::https://git.example.com/team/anyPkg.git", rev = "v1.0" }
+tarPkg = { url = "https://example.org/builds/tarPkg_1.2.0.tar.gz" }
 
 [dev-dependencies]
 testthat = "*"
 ```
+
+A `url` dependency is a source package tarball (`.tar.gz` or `.tgz`) at a fixed
+URL, such as an internal build artifact or an archived release. `uvr lock`
+downloads it, checks that it is an R source package (not a built binary), and
+records its `sha256` in `uvr.lock`. If the file at that URL changes later,
+`uvr sync` stops with a checksum error; run `uvr lock` to accept the change.
+After re-locking, sync reinstalls changed content even if `Version:` is unchanged.
+Installed packages and cached builds are reused only when their URL and checksum
+match the lock; older unmarked installs are rebuilt once. `sync --frozen` rejects
+a changed checksum without updating the lock.
+The entry name must match the tarball's DESCRIPTION `Package:` field. uvr sends
+no credentials for these downloads.
 
 Generated or imported git entries may also carry `exact = true`, which preserves an explicit DESCRIPTION `PackageName=` alias and requires the fetched DESCRIPTION `Package:` field to match the manifest dependency name.
 

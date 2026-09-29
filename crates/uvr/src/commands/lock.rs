@@ -44,8 +44,22 @@ pub async fn run(upgrade: bool) -> Result<()> {
 /// Re-resolve all dependencies and write `uvr.lock`.
 /// Called by `uvr lock`, `uvr add`, and `uvr remove`.
 pub async fn resolve_and_lock(project: &Project, upgrade: bool) -> Result<Lockfile> {
-    let client = build_client()?;
     let existing = load_existing_lockfile(project);
+    if !upgrade {
+        if let Some(mut locked) = existing.clone() {
+            // Reuse the whole resolution only when its inputs still match.
+            // Individual pins lose dependency constraints in legacy locks and
+            // can belong to a different R/Bioconductor release.
+            if super::sync::validate_frozen_lock(project, &locked).is_ok() {
+                locked.manifest_fingerprint = Some(project.manifest.lock_fingerprint()?);
+                project
+                    .save_lockfile(&locked)
+                    .context("Failed to write uvr.lock")?;
+                return Ok(locked);
+            }
+        }
+    }
+    let client = build_client()?;
     let lockfile =
         resolve_lockfile(project, &client, upgrade, existing.as_ref(), HashMap::new()).await?;
     warn_changed_url_tarballs(existing.as_ref(), &lockfile);
@@ -53,14 +67,6 @@ pub async fn resolve_and_lock(project: &Project, upgrade: bool) -> Result<Lockfi
         .save_lockfile(&lockfile)
         .context("Failed to write uvr.lock")?;
     Ok(lockfile)
-}
-
-/// Resolve dependencies and return the lockfile WITHOUT writing it to disk.
-/// Used by `uvr sync --frozen` to verify the existing lockfile is current.
-pub async fn resolve_only(project: &Project) -> Result<Lockfile> {
-    let client = build_client()?;
-    let existing = load_existing_lockfile(project);
-    resolve_lockfile(project, &client, false, existing.as_ref(), HashMap::new()).await
 }
 
 /// Resolve with upgrade=true WITHOUT writing the lockfile.
@@ -220,7 +226,7 @@ async fn resolve_lockfile(
     // The resolver records the Bioconductor release in the lockfile so it's
     // fully self-describing (#153).
     let resolved_bioc = bioc_opt.as_ref().map(|b| b.release());
-    let lockfile = if !custom_registries.is_empty() || bioc_opt.is_some() {
+    let chain = if !custom_registries.is_empty() || bioc_opt.is_some() {
         let mut chain: Vec<&dyn PackageRegistry> = Vec::new();
         for reg in &custom_registries {
             chain.push(reg);
@@ -229,25 +235,22 @@ async fn resolve_lockfile(
             chain.push(bioc);
         }
         chain.push(&cran);
-        let registry = RegistryChain::new(chain);
-        Resolver::new(&registry)
-            .resolve(
-                &project.manifest,
-                actual_r_version.as_deref(),
-                resolved_bioc,
-                pre_resolved,
-            )
-            .context("Dependency resolution failed")?
+        Some(RegistryChain::new(chain))
     } else {
-        Resolver::new(&cran)
-            .resolve(
-                &project.manifest,
-                actual_r_version.as_deref(),
-                resolved_bioc,
-                pre_resolved,
-            )
-            .context("Dependency resolution failed")?
+        None
     };
+    let registry: &dyn PackageRegistry = chain
+        .as_ref()
+        .map(|chain| chain as &dyn PackageRegistry)
+        .unwrap_or(&cran);
+    let lockfile = Resolver::new(registry)
+        .resolve(
+            &project.manifest,
+            actual_r_version.as_deref(),
+            resolved_bioc,
+            pre_resolved,
+        )
+        .context("Dependency resolution failed")?;
 
     spinner.finish_and_clear();
     Ok(lockfile)
@@ -826,6 +829,25 @@ fn is_same_resolution(a: &PackageInfo, b: &PackageInfo) -> bool {
 mod tests {
     use super::*;
     use uvr_core::manifest::{RemoteEntry, RemoteProvider, RemoteSource};
+
+    #[tokio::test]
+    async fn plain_lock_reuses_an_unchanged_resolution_without_network() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut manifest = uvr_core::manifest::Manifest::new("test", None);
+        manifest.add_dep(
+            "jsonlite".into(),
+            DependencySpec::Version("*".into()),
+            false,
+        );
+        manifest.write(&temp.path().join("uvr.toml")).unwrap();
+        let project = Project::find(temp.path()).unwrap();
+        let mut locked: Lockfile = "[r]\nversion = \"*\"\n\n[[package]]\nname = \"jsonlite\"\nversion = \"1.8.8\"\nsource = \"cran\"\nurl = \"https://cran.example/jsonlite_1.8.8.tar.gz\"\n".parse().unwrap();
+        locked.manifest_fingerprint = Some(manifest.lock_fingerprint().unwrap());
+        project.save_lockfile(&locked).unwrap();
+        let result = resolve_and_lock(&project, false).await.unwrap();
+        assert_eq!(result, locked);
+        assert_eq!(project.load_lockfile().unwrap().unwrap(), locked);
+    }
 
     fn git_dep(git: &str, rev: Option<&str>, subdirectory: Option<&str>) -> DependencySpec {
         DependencySpec::Detailed(uvr_core::manifest::DetailedDep {

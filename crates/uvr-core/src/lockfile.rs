@@ -7,6 +7,10 @@ use crate::manifest::atomic_write;
 /// Top-level `uvr.lock` structure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Lockfile {
+    /// Fingerprint of resolution inputs in uvr.toml. Older lockfiles omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_fingerprint: Option<String>,
+
     pub r: RVersionPin,
 
     /// Sorted alphabetically for deterministic diffs.

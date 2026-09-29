@@ -2402,7 +2402,7 @@ fn explain_url_checksum_mismatch(
         if let Some(plan) = url_plan {
             return anyhow::anyhow!(
                 "Checksum mismatch for {package}: the file at {url} is {actual}, but uvr.lock \
-                 records {expected}. The file changed since it was locked; run `uvr lock` if \
+                 records {expected}. The file changed since it was locked; run `uvr lock --upgrade` if \
                  the change is expected.",
                 url = plan.url
             );
@@ -3207,7 +3207,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
             "https://example.org/rlang_1.1.6.tar.gz",
             "sha256:old",
             "sha256:new",
-            "run `uvr lock` if the change is expected",
+            "run `uvr lock --upgrade` if the change is expected",
         ] {
             assert!(msg.contains(needle), "missing {needle}: {msg}");
         }

@@ -1033,6 +1033,34 @@ fn test_add_url_locks_url_and_checksum() {
     assert_eq!(pkg.source, uvr_core::lockfile::PackageSource::Url);
     assert_eq!(pkg.url.as_deref(), Some(url.as_str()));
     assert_eq!(pkg.checksum, Some(sha256(&bytes)));
+
+    // An unchanged manifest keeps its pinned archive until explicitly upgraded.
+    let changed = gzip_tar(&[
+        ("urlpkg/DESCRIPTION", "Package: urlpkg\nVersion: 0.1.0\nTitle: Changed archive\nDescription: Test package.\nLicense: MIT\nAuthor: uvr\nMaintainer: uvr <uvr@example.org>\nNeedsCompilation: no\n"),
+        ("urlpkg/NAMESPACE", "export(hello)\n"),
+        ("urlpkg/R/hello.R", "hello <- function() \"updated source\"\n"),
+    ]);
+    fs::write(root.path().join("build-artifact.tar.gz"), &changed).unwrap();
+    uvr_cmd()
+        .arg("lock")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let preserved = uvr_core::lockfile::Lockfile::from_file(&dir.path().join("uvr.lock")).unwrap();
+    assert_eq!(
+        preserved.get_package("urlpkg").unwrap().checksum,
+        Some(sha256(&bytes))
+    );
+    uvr_cmd()
+        .args(["lock", "--upgrade"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let refreshed = uvr_core::lockfile::Lockfile::from_file(&dir.path().join("uvr.lock")).unwrap();
+    assert_eq!(
+        refreshed.get_package("urlpkg").unwrap().checksum,
+        Some(sha256(&changed))
+    );
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -31,6 +31,23 @@ fn split_subdirectory_fragment(raw: &str) -> Result<(&str, Option<&str>)> {
 
 /// Parse `"pkg@>=1.0.0"`, `"user/repo@ref"`, or `"user/repo@ref#subdirectory=path"` into (name, spec).
 fn parse_add_spec(raw: &str, bioc: bool) -> Result<(String, DependencySpec)> {
+    // Direct source tarball (#189). Checked first: a URL contains '/' and
+    // would otherwise be reported as a malformed GitHub spec.
+    if raw.starts_with("https://") || raw.starts_with("http://") {
+        if !uvr_core::registry::url::is_source_tarball_url(raw) {
+            anyhow::bail!(
+                "Unsupported URL '{raw}'. Only direct source tarball URLs ending in .tar.gz or \
+                 .tgz are supported. For a git repository use user/repo[@ref], \
+                 forgejo::host/owner/repo[@ref], or gitlab::host/group/project[@ref]."
+            );
+        }
+        let spec = DependencySpec::Detailed(DetailedDep {
+            url: Some(raw.to_string()),
+            ..Default::default()
+        });
+        return Ok((url_name_hint(raw), spec));
+    }
+
     // Forgejo: explicit `forgejo::host/owner/repo[@ref]` prefix. Checked
     // before the bare `user/repo` heuristic below so a forgejo spec
     // doesn't get misclassified as a malformed GitHub spec.
@@ -163,6 +180,18 @@ fn parse_add_spec(raw: &str, bioc: bool) -> Result<(String, DependencySpec)> {
     Ok((name, spec))
 }
 
+/// `pkg` from `…/pkg_1.2.0.tar.gz`. A placeholder only: the tarball's
+/// DESCRIPTION names the package, unless `--no-lock` skips the download.
+fn url_name_hint(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = file
+        .strip_suffix(".tar.gz")
+        .or_else(|| file.strip_suffix(".tgz"))
+        .unwrap_or(file);
+    stem.split('_').next().unwrap_or(stem).to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     packages: Vec<String>,
@@ -213,6 +242,15 @@ pub async fn run(
         .map(|p| parse_add_spec(p, bioc))
         .collect::<Result<Vec<_>>>()?;
 
+    for url in parsed.iter().filter_map(|(_, spec)| spec.url()) {
+        if url.starts_with("http://") {
+            ui::warn(format!(
+                "{url} uses plain http. uvr.lock pins its sha256, but the first download is \
+                 not protected in transit."
+            ));
+        }
+    }
+
     // For GitHub specs (`user/repo@ref`), the URL-derived basename is only a
     // provisional package name. R's actual package name lives in the
     // remote's DESCRIPTION's `Package:` field — and for some packages
@@ -226,8 +264,21 @@ pub async fn run(
     // violate that contract and break offline scripted workflows. With
     // `--no-lock`, the manifest entry uses the URL-derived basename and
     // the user can edit it later if it diverges from the actual Package.
+    // A URL tarball (#189) gets the same treatment, except that its file
+    // name must already be a valid package name under `--no-lock`.
     if !no_lock {
         resolve_git_pkg_names(&mut parsed).await?;
+        resolve_url_pkg_names(&mut parsed).await?;
+    } else if let Some((name, spec)) = parsed
+        .iter()
+        .find(|(name, spec)| spec.url().is_some() && !package_name::is_valid(name))
+    {
+        anyhow::bail!(
+            "Cannot tell the package name of {} from its file name ('{name}') without \
+             downloading it. Run without --no-lock, or add it to uvr.toml by hand as \
+             `<name> = {{ url = \"...\" }}`.",
+            spec.url().unwrap_or_default()
+        );
     }
 
     // Reject base/recommended packages that ship with R — they can't be installed from CRAN.
@@ -644,11 +695,38 @@ async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Resul
     Ok(())
 }
 
+/// Download each URL spec (#189), reject anything that is not an R source
+/// tarball, and key it by its DESCRIPTION `Package:`. Unlike the git lookup
+/// above this is not best-effort: the download is the validation.
+async fn resolve_url_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Result<()> {
+    if parsed.iter().all(|(_, spec)| spec.url().is_none()) {
+        return Ok(());
+    }
+    let client = crate::commands::util::build_client()?;
+    for (name, spec) in parsed.iter_mut() {
+        let Some(url) = spec.url() else {
+            continue;
+        };
+        let (info, _, _) = uvr_core::registry::url::resolve_url_package(&client, url).await?;
+        if info.name != *name {
+            ui::bullet_dim(format!(
+                "{} → {} (Package: field in DESCRIPTION)",
+                palette::dim(&*name),
+                palette::pkg(&info.name)
+            ));
+            *name = info.name;
+        }
+    }
+    Ok(())
+}
+
 fn format_spec(spec: &DependencySpec) -> String {
     match spec {
         DependencySpec::Version(v) => v.clone(),
         DependencySpec::Detailed(d) => {
-            if let Some(git) = &d.git {
+            if let Some(url) = &d.url {
+                url.clone()
+            } else if let Some(git) = &d.git {
                 let rev = d.rev.as_deref().unwrap_or("HEAD");
                 match d.subdirectory.as_deref() {
                     Some(sub) => format!("{git}@{rev}#subdirectory={sub}"),
@@ -838,6 +916,52 @@ mod tests {
         assert!(msg.contains("forgejo::"), "should list Forgejo form: {msg}");
         assert!(msg.contains("gitlab::"), "should list GitLab form: {msg}");
         assert!(!msg.contains("Invalid GitHub spec"), "misleading: {msg}");
+    }
+
+    #[test]
+    fn parse_source_tarball_urls() {
+        for (raw, hint) in [
+            ("https://example.org/tpkg_1.2.0.tar.gz", "tpkg"),
+            ("http://127.0.0.1:8080/dl/data.pkg_0.1-2.tgz", "data.pkg"),
+            ("https://example.org/a/b/tpkg.tar.gz?token=x", "tpkg"),
+        ] {
+            let (name, spec) = parse_add_spec(raw, false).unwrap();
+            assert_eq!(name, hint, "{raw}");
+            assert_eq!(spec.url(), Some(raw));
+            assert_eq!(spec.git(), None);
+            assert_eq!(format_spec(&spec), raw);
+        }
+    }
+
+    #[test]
+    fn parse_rejects_urls_that_are_not_source_tarballs() {
+        for bad in [
+            "https://example.org/index.html",
+            "https://github.com/user/repo",
+            "https://example.org/tpkg_1.2.0.zip",
+            "http://",
+        ] {
+            let msg = parse_add_spec(bad, false).unwrap_err().to_string();
+            assert!(msg.contains("Unsupported URL"), "{bad}: {msg}");
+            assert!(msg.contains(".tar.gz"), "{bad}: {msg}");
+            assert!(!msg.contains("Invalid GitHub spec"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn url_sniffing_leaves_other_specs_alone() {
+        // `forgejo::`/`gitlab::` specs and bare host paths keep their own
+        // parsers and messages; only an http(s) scheme selects the URL path.
+        let (_, spec) = parse_add_spec("forgejo::codefloe.com/pat-s/mypkg", false).unwrap();
+        assert_eq!(spec.url(), None);
+        let (_, spec) = parse_add_spec("gitlab::gitlab.com/g/mypkg", false).unwrap();
+        assert_eq!(spec.url(), None);
+        let (_, spec) = parse_add_spec("owner/repo.tar.gz", false).unwrap();
+        assert_eq!(spec.url(), None);
+        let msg = parse_add_spec("example.org/pkg_1.0.tar.gz/x", false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("Unsupported git host"), "{msg}");
     }
 
     #[test]

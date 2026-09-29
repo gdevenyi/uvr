@@ -5,6 +5,8 @@ use crate::lockfile::LockedPackage;
 
 pub const MARKER_FILENAME: &str = "uvr-nested-source";
 
+/// Provenance for pinned sources; the historical name and marker filename
+/// are retained for compatibility with existing nested GitHub installs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NestedProvenance {
     pub source: String,
@@ -16,6 +18,23 @@ pub struct NestedProvenance {
 impl NestedProvenance {
     pub fn from_locked(p: &LockedPackage) -> Result<Option<Self>> {
         crate::registry::github::validate_nested_lock_entry(p)?;
+        if let Some((source, url)) = pinned_source(p) {
+            let provenance = Self {
+                source: source.to_string(),
+                url: url.to_string(),
+                checksum: p.checksum.clone().unwrap_or_default(),
+                subdirectory: String::new(),
+            };
+            if p.subdirectory.is_some()
+                || Self::parse(&provenance.to_file_contents()).as_ref() != Some(&provenance)
+            {
+                return Err(UvrError::Other(format!(
+                    "Invalid pinned source identity for '{}'; run `uvr lock` to regenerate it",
+                    p.name
+                )));
+            }
+            return Ok(Some(provenance));
+        }
         let source = match &p.source {
             crate::lockfile::PackageSource::GitHub => "github".to_string(),
             crate::lockfile::PackageSource::Forgejo { host } => format!("forgejo:{host}"),
@@ -101,18 +120,33 @@ impl NestedProvenance {
             *slot = Some(value.to_string());
         }
         let (source, url, checksum, subdirectory) = (source?, url?, checksum?, subdirectory?);
-        if source != "github" && !source.starts_with("forgejo:") && !source.starts_with("gitlab:") {
+        if url.is_empty() || url.chars().any(char::is_control) {
             return None;
         }
-        if url.is_empty()
-            || (!subdirectory.is_empty() && !crate::subdirectory::is_valid(&subdirectory))
-        {
-            return None;
-        }
-        if !checksum
-            .strip_prefix("git:")
-            .is_some_and(crate::registry::github::is_full_commit_sha)
-        {
+        let hex = |prefix: &str, lengths: &[usize]| {
+            checksum.strip_prefix(prefix).is_some_and(|s| {
+                lengths.contains(&s.len()) && s.bytes().all(|c| c.is_ascii_hexdigit())
+            })
+        };
+        let valid = match source.as_str() {
+            source
+                if source == "github"
+                    || source.starts_with("forgejo:")
+                    || source.starts_with("gitlab:") =>
+            {
+                (subdirectory.is_empty() || crate::subdirectory::is_valid(&subdirectory))
+                    && checksum
+                        .strip_prefix("git:")
+                        .is_some_and(crate::registry::github::is_full_commit_sha)
+            }
+            "url" => {
+                subdirectory.is_empty()
+                    && crate::registry::url::is_source_tarball_url(&url)
+                    && hex("sha256:", &[64])
+            }
+            _ => false,
+        };
+        if !valid {
             return None;
         }
         Some(NestedProvenance {
@@ -121,6 +155,13 @@ impl NestedProvenance {
             checksum,
             subdirectory,
         })
+    }
+}
+
+fn pinned_source(p: &LockedPackage) -> Option<(&str, &str)> {
+    match &p.source {
+        crate::lockfile::PackageSource::Url => Some(("url", p.url.as_deref().unwrap_or_default())),
+        _ => None,
     }
 }
 

@@ -59,7 +59,7 @@ Pure tracking section — fixes and small features land here between tags.
   the lockfile pins the URL and a `sha256` checksum (`source = "url"`), and
   `uvr sync` installs that exact file from source, never a same-named binary.
   If the file changes, sync fails with both checksums and asks you to run
-  `uvr lock`. A URL that is not an R source package (a web page, a built
+  `uvr lock --upgrade`. A URL that is not an R source package (a web page, a built
   binary, a tarball without one top-level package directory) is rejected
   when you add or lock it. `uvr export` writes these as renv `URL` remotes.
 

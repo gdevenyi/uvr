@@ -305,9 +305,9 @@ pub fn tarball_url(user: &str, repo: &str, commit_sha: &str) -> String {
 }
 
 pub fn validate_nested_lock_entry(p: &LockedPackage) -> Result<()> {
-    let Some(sub) = p.subdirectory.as_deref() else {
+    if p.source != PackageSource::GitHub && p.subdirectory.is_none() {
         return Ok(());
-    };
+    }
     let bad = |msg: String| UvrError::Other(format!("Locked package '{}': {msg}", p.name));
     if p.source != PackageSource::GitHub {
         return Err(bad(format!(
@@ -321,7 +321,9 @@ pub fn validate_nested_lock_entry(p: &LockedPackage) -> Result<()> {
             p.name
         )));
     }
-    crate::subdirectory::validate(sub)?;
+    if let Some(sub) = p.subdirectory.as_deref() {
+        crate::subdirectory::validate(sub)?;
+    }
     let commit = p
         .checksum
         .as_deref()

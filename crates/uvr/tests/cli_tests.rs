@@ -4,7 +4,16 @@ use std::fs;
 use tempfile::TempDir;
 
 fn uvr_cmd() -> Command {
-    Command::cargo_bin("uvr").unwrap()
+    let mut cmd = Command::cargo_bin("uvr").unwrap();
+    // The binary inherits the parent environment, so running the suite from a
+    // Positron/RStudio terminal — or with UVR_UNATTENDED/UVR_NO_COMPANION
+    // exported — would change these tests' results. Strip the vars that drive
+    // IDE detection and headless mode. Tests that need them set them
+    // explicitly afterwards; a later `.env()` overrides this.
+    for var in ["POSITRON", "RSTUDIO", "UVR_UNATTENDED", "UVR_NO_COMPANION"] {
+        cmd.env_remove(var);
+    }
+    cmd
 }
 
 fn init_project(name: &str) -> TempDir {
@@ -907,6 +916,57 @@ fn lock_with_binary_capable_source_records_source_urls() {
     assert!(
         lock.contains(&format!("{}/src/contrib/jsonlite", server_url)),
         "lockfile should record the source URL from rpkgs-stub: {lock}"
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn frozen_sync_that_bails_writes_no_scaffolding() {
+    // Regression for the ordering of the `--frozen` staleness check in
+    // `sync::run_inner`: the project-plumbing writes (`.Rprofile`, ...) used
+    // to run *before* the check, so a frozen sync that bailed on a stale
+    // lockfile still dirtied the working tree. The write block now runs after
+    // the check, so a bail must not write any scaffolding.
+    let (server_url, _server) = spawn_rpkgs_stub();
+
+    let dir = init_project("frozen-nowrite");
+    let toml_path = dir.path().join("uvr.toml");
+    let mut toml = fs::read_to_string(&toml_path).unwrap();
+    toml.push_str(&format!(
+        "\n[[sources]]\nname = \"rpkgs-stub\"\nurl = \"{}\"\n",
+        server_url
+    ));
+    fs::write(&toml_path, toml).unwrap();
+
+    // Lock the empty dependency set, then make the manifest stale by adding a
+    // dependency the lockfile doesn't know about.
+    uvr_cmd()
+        .args(["lock"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let mut manifest = uvr_core::manifest::Manifest::from_file(&toml_path).unwrap();
+    manifest.add_dep(
+        "jsonlite".into(),
+        uvr_core::manifest::DependencySpec::Version("*".into()),
+        false,
+    );
+    manifest.write(&toml_path).unwrap();
+
+    // `init` wrote `.Rprofile`; remove it so the test can tell whether a
+    // failing `--frozen` sync recreates it.
+    fs::remove_file(dir.path().join(".Rprofile")).unwrap();
+
+    uvr_cmd()
+        .args(["sync", "--frozen"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("out of date"));
+
+    assert!(
+        !dir.path().join(".Rprofile").exists(),
+        "a --frozen sync that bailed wrote .Rprofile; the plumbing writes must run after the staleness check"
     );
 }
 
@@ -2324,4 +2384,178 @@ fn test_an_unsupported_r_pin_in_a_header_is_reported_not_swallowed() {
         .success()
         .stdout(predicate::str::contains("RAN"))
         .stderr(predicate::str::contains("does not honour yet"));
+}
+
+// ─── IDE-mode scaffolding ─────────────────────────────────────────
+
+#[test]
+fn test_init_default_writes_rprofile_but_no_ide_config() {
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["init", "--here", "plainproj"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join(".Rprofile").exists());
+    assert!(!dir.path().join(".vscode").exists());
+}
+
+#[test]
+fn test_init_ide_positron_writes_vscode_settings() {
+    if !have_r() {
+        eprintln!("skipping: no R on PATH");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["init", "--here", "posproj", "--ide=positron"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join(".vscode").join("settings.json").exists());
+    let settings = fs::read_to_string(dir.path().join(".vscode").join("settings.json")).unwrap();
+    assert!(settings.contains("positron.r.interpreters.default"));
+}
+
+#[test]
+fn test_init_ide_rejects_unsupported_rstudio() {
+    // `--ide` only accepts `positron` today. RStudio has no config in uvr, so
+    // rejecting the value is better than accepting a silent no-op. Adding
+    // RStudio later means adding it to `Ide` and the config writer.
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["init", "--here", "rstudioproj", "--ide=rstudio"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value"));
+}
+
+#[test]
+fn test_init_positron_env_writes_vscode_settings() {
+    if !have_r() {
+        eprintln!("skipping: no R on PATH");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["init", "--here", "envposproj"])
+        .env("POSITRON", "1")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join(".vscode").join("settings.json").exists());
+}
+
+#[test]
+fn test_init_rstudio_env_still_wires_library_but_writes_no_ide_config() {
+    // RStudio is not a supported `--ide` value, but its users are still served:
+    // `.Rprofile` wires the library and no IDE config is written. Pin that so
+    // removing the RStudio variant does not silently break RStudio terminals.
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["init", "--here", "envrstudioproj"])
+        .env("RSTUDIO", "1")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join(".Rprofile").exists());
+    assert!(!dir.path().join(".vscode").exists());
+}
+
+#[test]
+fn test_init_unattended_writes_only_manifest_and_library() {
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["init", "--here", "unattendedproj", "--unattended"])
+        .env("POSITRON", "1")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join("uvr.toml").exists());
+    assert!(dir.path().join(".uvr").join("library").exists());
+    assert!(!dir.path().join(".Rprofile").exists());
+    assert!(!dir.path().join(".gitignore").exists());
+    assert!(!dir.path().join(".uvr").join("activate").exists());
+    assert!(!dir.path().join(".vscode").exists());
+}
+
+#[test]
+fn test_init_unattended_before_subcommand_still_beats_explicit_ide() {
+    // The removed `conflicts_with = "unattended"` only fired when the global
+    // flag followed the subcommand, so `uvr --unattended init --ide positron`
+    // was accepted anyway. It is accepted for every spelling now; the runtime
+    // gate must still make `--unattended` win and write no IDE config.
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args([
+            "--unattended",
+            "init",
+            "--here",
+            "unattendedide",
+            "--ide=positron",
+        ])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join("uvr.toml").exists());
+    assert!(!dir.path().join(".Rprofile").exists());
+    assert!(!dir.path().join(".vscode").exists());
+}
+
+#[test]
+fn test_init_bare_conflicts_with_ide() {
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["init", "--here", "bareide", "--bare", "--ide=positron"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn test_init_no_ide_overrides_positron_env() {
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["init", "--here", "noideproj", "--no-ide"])
+        .env("POSITRON", "1")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join(".Rprofile").exists());
+    assert!(!dir.path().join(".vscode").exists());
+}
+
+#[test]
+fn test_init_bare_skips_scaffolding_but_ignores_library() {
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["init", "--here", "bareproj", "--bare"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join("uvr.toml").exists());
+    assert!(dir.path().join(".uvr").join("library").exists());
+    assert!(!dir.path().join(".Rprofile").exists());
+    assert!(dir.path().join(".gitignore").exists());
+    let gitignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains("/.uvr/library/"));
+    assert!(!dir.path().join(".uvr").join("activate").exists());
+    assert!(!dir.path().join(".vscode").exists());
+    let manifest = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
+    assert!(manifest.contains("bare = true"));
+}
+
+#[test]
+fn test_ide_flag_is_scoped_to_init_sync_import() {
+    // `--ide` is only meaningful where IDE config is written. On `add` it
+    // must be rejected at parse time, not silently accepted and ignored.
+    let dir = TempDir::new().unwrap();
+    uvr_cmd()
+        .args(["add", "--ide=positron", "ggplot2"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }

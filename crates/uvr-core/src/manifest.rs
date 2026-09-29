@@ -55,6 +55,13 @@ pub struct ProjectMeta {
 
     #[serde(default)]
     pub description: Option<String>,
+
+    /// Created with `uvr init --bare`: the project ships only `uvr.toml`,
+    /// `.uvr/library/`, and a protective `.gitignore`. `.Rprofile`,
+    /// activation shims, IDE config, and the companion package are all
+    /// skipped, and the library is reachable through `uvr run`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bare: bool,
 }
 
 /// Either a bare version string (`">=3.0.0"`, `"*"`) or a detailed table.
@@ -319,6 +326,7 @@ impl Manifest {
         let mut inputs = self.clone();
         inputs.project.name.clear();
         inputs.project.description = None;
+        inputs.project.bare = false;
         inputs.activate = None;
         let canonical = toml::to_string(&inputs).map_err(UvrError::TomlSer)?;
         Ok(format!(
@@ -334,6 +342,7 @@ impl Manifest {
                 r_version,
                 bioc_version: None,
                 description: None,
+                bare: false,
             },
             dependencies: BTreeMap::new(),
             dev_dependencies: BTreeMap::new(),
@@ -464,6 +473,7 @@ impl Manifest {
                 r_version,
                 bioc_version: None,
                 description: fields.get("Title").cloned(),
+                bare: false,
             },
             dependencies,
             dev_dependencies,
@@ -505,6 +515,7 @@ impl Manifest {
 
         for (key, changed) in [
             ("name", previous.project.name != self.project.name),
+            ("bare", previous.project.bare != self.project.bare),
             (
                 "r_version",
                 previous.project.r_version != self.project.r_version,
@@ -2326,5 +2337,22 @@ tpkg = { url = "https://example.org/tpkg_1.2.0.tar.gz" }
             let err = toml.parse::<Manifest>().unwrap_err().to_string();
             assert!(err.contains(needle), "{spec}: {err}");
         }
+    }
+    #[test]
+    fn bare_mode_preserves_lock_inputs_and_manifest_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("uvr.toml");
+        let original = "# project note\n[project]\nname = \"test\"\nbare = false # setup mode\n[tool.example]\nkeep = true\n";
+        std::fs::write(&path, original).unwrap();
+        let mut manifest = Manifest::from_file(&path).unwrap();
+        let fingerprint = manifest.lock_fingerprint().unwrap();
+        manifest.project.bare = true;
+        assert_eq!(manifest.lock_fingerprint().unwrap(), fingerprint);
+        manifest.write(&path).unwrap();
+        assert!(Manifest::from_file(&path).unwrap().project.bare);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("bare = true # setup mode"));
+        assert!(written.contains("# project note"));
+        assert!(written.contains("[tool.example]\nkeep = true"));
     }
 }

@@ -9,6 +9,21 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **IDE config is now opt-in; CI mode is explicit** (#176, #206).
+  `uvr init`/`sync`/`import` no longer assume an RStudio/Positron workflow:
+  `.vscode/settings.json` and IDE-oriented hints are only produced when
+  Positron is detected (`POSITRON=1`) or forced with `--ide=positron` (now
+  scoped to `init`/`sync`/`import`).
+  `--no-ide` suppresses them, `--no-companion` (`UVR_NO_COMPANION=1`) skips
+  the injected companion R package, and `--unattended` (`UVR_UNATTENDED=1`)
+  disables all of the above *and* every working-tree write (`.Rprofile`,
+  `.gitignore`, activation shims) so a checked-out repository stays
+  byte-identical. `uvr sync --frozen` runs its staleness check before writing
+  any scaffolding, so a stale lockfile fails without dirtying the checkout.
+  `uvr init --bare` is the persistent form for interactive
+  use: `uvr.toml`, `.uvr/library/`, and a protective `.gitignore`, persisted
+  in `[project] bare = true`.
+
 - **`uvr scan` now detects `box::use()` imports.** Package declarations
   (`box::use(dplyr[filter])`, `box::use(gg = ggplot2)`) are discovered;
   local module paths (`box::use(./mod)`, `box::use(prefix/mod)`) are

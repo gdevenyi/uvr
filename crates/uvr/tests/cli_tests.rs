@@ -3306,7 +3306,6 @@ fn fake_r_installs(versions: &[&str]) -> TempDir {
     dir
 }
 
-/// Stand-in managed Rs and a private config directory for the global pin.
 /// Stand-in managed Rs and a private config directory for the global pin. The
 /// real R on the machine is still found, so a constraint here has an upper
 /// bound.
@@ -3788,6 +3787,38 @@ fn test_uvr_r_version_gives_no_pin_mismatch_warning() {
         .success()
         .stdout(predicate::str::contains("FAKE-R 3.1.0"))
         .stderr(predicate::str::contains("mismatch").not());
+}
+
+/// `.Rprofile` runs inside R, so a stand-in R cannot test it. A pin of 0.1 is
+/// different from any real R, and `uvr init` writes the real `.Rprofile`.
+#[test]
+fn test_rprofile_gives_no_pin_mismatch_message_under_uvr_r_version() {
+    if !have_r() {
+        eprintln!("skipping: no R on PATH");
+        return;
+    }
+    let dir = init_project("rprofile");
+    fs::write(dir.path().join(".r-version"), "0.1\n").unwrap();
+    let r_stderr = |variable: Option<&str>| {
+        let mut rscript = std::process::Command::new("Rscript");
+        rscript
+            .args(["-e", "invisible(NULL)"])
+            .current_dir(dir.path())
+            .env_remove("R_PROFILE_USER")
+            .env_remove("UVR_R_VERSION");
+        if let Some(value) = variable {
+            rscript.env("UVR_R_VERSION", value);
+        }
+        let output = rscript.output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stderr).unwrap()
+    };
+    let message = "active but .r-version pins 0.1";
+
+    assert!(r_stderr(None).contains(message));
+    assert!(!r_stderr(Some("4.5")).contains(message));
+    // uvr treats a blank variable as unset, so the pin still applies.
+    assert!(r_stderr(Some(" ")).contains(message));
 }
 
 #[cfg(unix)]

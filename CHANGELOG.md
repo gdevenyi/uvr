@@ -84,8 +84,9 @@ Pure tracking section — fixes and small features land here between tags.
   is honoured; `%APPDATA%\uvr` on Windows), applies where no project pin does,
   and is used only if it satisfies the project's or script's constraint.
   `UVR_R_VERSION` goes above the project pin, for a CI matrix that must not edit
-  the committed pin. `uvr r find` and `uvr doctor` say which rule selected the
-  R.
+  the committed pin, and the project `.Rprofile` gives no pin mismatch message
+  under it (after the next `uvr sync` refreshes that file). `uvr r find` and
+  `uvr doctor` say which rule selected the R.
 
 ## v0.4.8 (2026-10-22)
 

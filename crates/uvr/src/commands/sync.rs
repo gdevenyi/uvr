@@ -392,10 +392,20 @@ pub async fn run_inner(
             {
                 let from = r_minor(&lockfile.r.version);
                 let to = r_minor(cur);
+                // A pin cannot undo UVR_R_VERSION, so do not suggest one.
+                let advice = if uvr_core::env_vars::r_version().is_some() {
+                    "UVR_R_VERSION selects this R. If this switch is unintended, unset it \
+                     and re-run `uvr sync`."
+                        .to_string()
+                } else {
+                    format!(
+                        "If this switch is unintended, pin the old version with \
+                         `uvr r pin {from}` and re-run `uvr sync`."
+                    )
+                };
                 ui::warn(format!(
                     "uvr.lock was resolved for R {} but the active R is {} — re-resolving \
-                     the lockfile for R {}. If this switch is unintended, pin the old \
-                     version with `uvr r pin {from}` and re-run `uvr sync`.",
+                     the lockfile for R {}. {advice}",
                     palette::dim(&from),
                     palette::info(&to),
                     palette::info(&to),

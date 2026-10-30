@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{AddArgs, CacheCommands, Cli, Commands, RCommands, RemoveArgs};
+use cli::{AddArgs, CacheCommands, Cli, Commands, RCommands, RemoveArgs, ScanArgs};
 
 #[tokio::main]
 async fn main() {
@@ -91,6 +91,7 @@ async fn run() -> Result<()> {
             | Commands::Export(_)
             | Commands::Import(_)
             | Commands::Doctor
+            | Commands::Scan(ScanArgs { add: true, .. })
     ) {
         commands::util::warn_r_pin_mismatch();
     }

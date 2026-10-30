@@ -76,6 +76,18 @@ Pure tracking section — fixes and small features land here between tags.
   every resolved dependency whether or not it is installed here, and exits 0:
   an image being built has none of it yet, so filtering against the current
   host is the wrong question. Linux-only, like the check it wraps.
+- **`uvr scan --add` adds the packages a scan reports** (#78, #251). `uvr scan`
+  already found every `library()`, `require()`, `pkg::fn`, `box::use()` and
+  roxygen `@import` the code uses, then asked the user to retype the list into
+  `uvr add`. `--add` hands the missing set straight to `uvr add`, so adopting an
+  unmanaged project takes `uvr init --here` and one more command. It asks first
+  in a terminal. Composing with `add` rather than writing the manifest directly
+  means resolution, the lockfile update, the install and the rollback-on-failure
+  stay one implementation — including `add`'s all-or-nothing semantics. The scan
+  now skips comments, the project's own name, and a variable given to
+  `library(p, character.only = TRUE)`, for the report too. Conflicts with
+  `--all`, which reports declared packages too and so has nothing actionable in
+  it.
 
 ## v0.4.8 (2026-10-22)
 
@@ -494,15 +506,6 @@ Two changes may need action:
   `uvr r uninstall <ver> && uvr r install <ver>`. Reported with a
   verified one-line diagnosis by @Felixmil.
 
-- **`uvr scan --add` adds the packages a scan reports** (#78, #251). `uvr scan`
-  already found every `library()`, `require()`, `pkg::fn` and roxygen `@import`
-  the code uses, then asked the user to retype the list into `uvr add`.
-  `--add` hands the missing set straight to `uvr add`, which makes adopting an
-  unmanaged project one command. Composing with `add` rather than writing the
-  manifest directly means resolution, the lockfile update, the install and the
-  rollback-on-failure stay one implementation — including `add`'s
-  all-or-nothing semantics. Conflicts with `--all`, which reports declared
-  packages too and so has nothing actionable in it.
 - **GitHub dependencies can select an R package in a repository
   subdirectory, directly or through transitive DESCRIPTION `Remotes:`** (#244).
   Direct declarations use

@@ -332,9 +332,10 @@ only — reach it through `uvr run`.
 ## Adopting an existing project
 
 A project with no manifest still declares its dependencies — in the code.
-`uvr scan` reads them out, walking every `.R`, `.Rmd` and `.Qmd` file (honouring
-`.gitignore` and `.uvrignore`) and reporting each `library()`, `require()`,
-`pkg::fn` and roxygen `@import` whose package is not in `uvr.toml`:
+After `uvr init --here`, `uvr scan` reads them out, walking every `.R`, `.Rmd`
+and `.Qmd` file (honouring `.gitignore` and `.uvrignore`) and reporting each
+`library()`, `require()`, `pkg::fn`, `box::use()` and roxygen `@import` whose
+package is not in `uvr.toml`:
 
 ```console
 $ uvr scan
@@ -343,12 +344,17 @@ $ uvr scan
   praise (missing) analysis.R
 ```
 
-`--add` hands that list to `uvr add`, so adopting an unmanaged project is one
-command:
+`--add` hands that list to `uvr add`, so adopting an unmanaged project takes
+two commands:
 
 ```sh
+uvr init --here
 uvr scan --add
 ```
+
+In a terminal, `--add` shows the list and asks first. Elsewhere it goes ahead.
+The scan skips comments, the project's own name, and a variable given to
+`library(p, character.only = TRUE)`.
 
 Take the direct dependencies from the code rather than from an installed
 library. `installed.packages()` returns the whole transitive closure, and

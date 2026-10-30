@@ -3906,16 +3906,20 @@ fn test_scan_add_conflicts_with_all() {
 }
 
 #[test]
-fn test_scan_add_with_nothing_missing_does_not_call_add() {
-    // No network involved: with nothing to add there is nothing to
-    // resolve, so the command must succeed offline.
+fn test_scan_add_ignores_the_project_itself() {
+    // No network involved: the project's own name is not a dependency, so
+    // nothing is left to resolve and the command must succeed offline.
     let dir = TempDir::new().unwrap();
     uvr_cmd()
         .args(["init", "--here", "scanproj"])
         .current_dir(dir.path())
         .assert()
         .success();
-    fs::write(dir.path().join("only_base.R"), "x <- utils::head(1:3)\n").unwrap();
+    fs::write(
+        dir.path().join("own.R"),
+        "library(scanproj)\n# library(removedpkg)\nx <- utils::head(1:3)\n",
+    )
+    .unwrap();
     uvr_cmd()
         .args(["scan", "--add"])
         .current_dir(dir.path())

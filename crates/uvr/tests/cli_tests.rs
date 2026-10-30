@@ -3789,6 +3789,46 @@ fn test_uvr_r_version_gives_no_pin_mismatch_warning() {
         .stderr(predicate::str::contains("mismatch").not());
 }
 
+/// The variable outranks a directory pin, so a flag that replaces the variable
+/// must not bring the pin back. Without the variable, the pin beats the flag.
+#[cfg(unix)]
+#[test]
+fn test_r_version_flag_with_uvr_r_version_does_not_bring_back_a_directory_pin() {
+    let r = RFinder::new(&["3.0.1", "3.0.2", "3.1.0"]);
+    let dir = TempDir::new().unwrap();
+    let manifest = "[project]\nname = \"p\"\n\n[dependencies]\n";
+    fs::write(dir.path().join("uvr.toml"), manifest).unwrap();
+    fs::write(dir.path().join(".r-version"), "3.1.0\n").unwrap();
+    fs::write(dir.path().join("plain.R"), "").unwrap();
+
+    // The flag agrees with the variable.
+    r.cmd(dir.path())
+        .args(["run", "--r-version", "==3.0.1", "plain.R"])
+        .env("UVR_R_VERSION", "3.0")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("FAKE-R 3.0.1"))
+        .stderr(predicate::str::contains("takes precedence").not());
+
+    // The flag does not agree with the variable. The flag wins, and the pin
+    // still does not.
+    r.cmd(dir.path())
+        .args(["run", "--r-version", "==3.0.2", "plain.R"])
+        .env("UVR_R_VERSION", "3.0.1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("FAKE-R 3.0.2"));
+
+    // No variable: the pin wins, and the warning does not blame uvr.toml.
+    r.cmd(dir.path())
+        .args(["run", "--r-version", "==3.0.1", "plain.R"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("FAKE-R 3.1.0"))
+        .stderr(predicate::str::contains("takes precedence"))
+        .stderr(predicate::str::contains("uvr.toml").not());
+}
+
 /// `.Rprofile` runs inside R, so a stand-in R cannot test it. A pin of 0.1 is
 /// different from any real R, and `uvr init` writes the real `.Rprofile`.
 #[test]

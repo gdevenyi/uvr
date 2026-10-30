@@ -211,7 +211,13 @@ pub fn find_r_binary_satisfying(constraint: &str) -> Result<PathBuf> {
 /// For `uvr run --r-version`: an explicit flag outranks `UVR_R_VERSION` and the
 /// global pin, as a flag does its environment form in uv. `honour_pin` is false
 /// in script mode, which ignores directory pins.
+///
+/// A directory pin outranks the flag, as it does a constraint, except when
+/// `UVR_R_VERSION` is set. The variable outranks the pin, so the pin must not
+/// come back only because a flag replaced the variable: the result would be an
+/// R that neither of them asked for.
 pub fn find_r_binary_for_flag(constraint: &str, honour_pin: bool) -> Result<PathBuf> {
+    let honour_pin = honour_pin && crate::env_vars::r_version().is_none();
     let cwd = honour_pin.then(pin_start_dir);
     let rules = Rules {
         env_override: false,
@@ -381,15 +387,16 @@ fn resolve_r_binary(
                 bin.display()
             )));
         };
-        // The pin always wins over the uvr.toml constraint, but silent drift
-        // between the two is confusing (`uvr r use 4.3.0` after setting
-        // `r_version = "^4.5"`, #156) — surface it without changing precedence.
+        // The pin always wins over the constraint (from uvr.toml or from
+        // `uvr run --r-version`), but silent drift between the two is confusing
+        // (`uvr r use 4.3.0` after setting `r_version = "^4.5"`, #156) — surface
+        // it without changing precedence.
         if let Some(constraint) = version_constraint {
             if pin_conflicts_with_constraint(&resolved, constraint) {
                 tracing::warn!(
                     ".r-version pins R {pinned} (resolved to {resolved}), which does not \
-                     satisfy the uvr.toml constraint `{constraint}`; the pin takes \
-                     precedence. Update .r-version or uvr.toml to bring them back in sync."
+                     satisfy the constraint `{constraint}`; the pin takes precedence. \
+                     Update .r-version or the constraint to bring them back in sync."
                 );
             }
         }

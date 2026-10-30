@@ -553,8 +553,10 @@ uvr selects R with the first of these rules that applies:
    command fails if no installed R matches. This includes `uvr init`, except
    with `--bare`. Commands that select no R, such as `uvr r install`, ignore it.
    `uvr run --r-version` outranks it, also when it installs packages, and it
-   never downloads an R. The project `.Rprofile` gives no pin mismatch message
-   under it.
+   never downloads an R. If you set the flag and the variable, uvr does not use
+   a `.r-version`. If you set only the flag, a `.r-version` wins over the flag in
+   a project. The project `.Rprofile` gives no pin mismatch message under the
+   variable.
 1. A `.r-version` in the working directory or a parent.
 2. The global pin, `$XDG_CONFIG_HOME/uvr/.r-version` or
    `~/.config/uvr/.r-version` (`%APPDATA%\uvr\.r-version` on Windows). The

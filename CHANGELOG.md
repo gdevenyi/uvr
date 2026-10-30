@@ -76,6 +76,9 @@ Pure tracking section — fixes and small features land here between tags.
   every resolved dependency whether or not it is installed here, and exits 0:
   an image being built has none of it yet, so filtering against the current
   host is the wrong question. Linux-only, like the check it wraps.
+- **README Rationale now notes `ir` and `rpx`** (#126). Each note uses only
+  the tool's own README and repository data. The feature matrix does not
+  change.
 
 ## v0.4.8 (2026-10-22)
 

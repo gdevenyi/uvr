@@ -623,9 +623,9 @@ mod rprofile_tests {
     }
 
     /// Start R with `dir/.Rprofile` as the user profile and `path` as PATH,
-    /// and return what it wrote to stderr. `None` when R cannot be spawned.
+    /// and return what it wrote to stderr.
     #[cfg(unix)]
-    fn r_startup_stderr(dir: &Path, interactive: bool, path: &std::ffi::OsStr) -> Option<String> {
+    fn r_startup_stderr(dir: &Path, interactive: bool, path: &std::ffi::OsStr) -> String {
         let mut cmd = if interactive {
             let mut c = std::process::Command::new("R");
             c.args([
@@ -648,18 +648,39 @@ mod rprofile_tests {
             .env("PATH", path)
             .stdin(std::process::Stdio::null())
             .output()
-            .ok()?;
+            .expect("R is on PATH, so it must start");
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(out.status.success(), "R failed: {stderr}");
-        Some(stderr)
+        stderr
+    }
+
+    /// `path` with no `uvr` on it. A directory that holds `uvr` can also hold
+    /// `R` and the tools R's start script needs (`/usr/bin`, a conda `bin`), so
+    /// it is replaced by a directory under `scratch` that links everything else.
+    #[cfg(unix)]
+    fn path_without_uvr(path: &std::ffi::OsStr, scratch: &Path) -> std::ffi::OsString {
+        let dirs = std::env::split_paths(path).enumerate().map(|(i, d)| {
+            if !d.join("uvr").exists() {
+                return d;
+            }
+            let links = scratch.join(format!("path-{i}"));
+            std::fs::create_dir(&links).unwrap();
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                if entry.file_name() != "uvr" {
+                    std::os::unix::fs::symlink(entry.path(), links.join(entry.file_name()))
+                        .unwrap();
+                }
+            }
+            links
+        });
+        std::env::join_paths(dirs.collect::<Vec<_>>()).unwrap()
     }
 
     #[test]
     #[cfg(unix)]
     fn rprofile_snippet_prints_the_install_hint_only_when_uvr_is_missing() {
         // #87, end to end in a real R: HOME points at the temp project, so
-        // ~/.local/bin and ~/.cargo/bin hold no uvr, and PATH keeps only
-        // directories without one.
+        // ~/.local/bin and ~/.cargo/bin hold no uvr, and PATH has none.
         if ["/usr/local/bin/uvr", "/opt/homebrew/bin/uvr"]
             .iter()
             .any(|p| Path::new(p).exists())
@@ -680,15 +701,13 @@ mod rprofile_tests {
         )
         .unwrap();
         let original = std::env::var_os("PATH").unwrap_or_default();
-        let without_uvr = std::env::join_paths(
-            std::env::split_paths(&original).filter(|d| !d.join("uvr").exists()),
-        )
-        .unwrap();
-
-        let Some(missing) = r_startup_stderr(dir, true, &without_uvr) else {
+        if !std::env::split_paths(&original).any(|d| d.join("R").is_file()) {
             eprintln!("skipping: no R on PATH");
             return;
-        };
+        }
+        let without_uvr = path_without_uvr(&original, dir);
+
+        let missing = r_startup_stderr(dir, true, &without_uvr);
         assert!(
             missing.contains(
                 "uvr: uvr command not found. Run uvr::install_uvr(), or install it in a terminal with:\n  curl -fsSL https://raw.githubusercontent.com/nbafrank/uvr/main/install.sh | sh\n"
@@ -698,7 +717,7 @@ mod rprofile_tests {
         assert!(!missing.contains("Error"), "{missing}");
 
         // Rscript (non-interactive) stays silent even without uvr.
-        let batch = r_startup_stderr(dir, false, &without_uvr).expect("Rscript runs");
+        let batch = r_startup_stderr(dir, false, &without_uvr);
         assert!(!batch.contains("command not found"), "{batch}");
 
         // A uvr on PATH silences the hint.
@@ -708,7 +727,7 @@ mod rprofile_tests {
         let with_uvr =
             std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&without_uvr)))
                 .unwrap();
-        let present = r_startup_stderr(dir, true, &with_uvr).expect("R runs");
+        let present = r_startup_stderr(dir, true, &with_uvr);
         assert!(!present.contains("command not found"), "{present}");
         assert!(present.contains("uvr: library active"), "{present}");
     }

@@ -476,6 +476,7 @@ Two changes may need action:
   dependency, and it checks installed and cached packages against the commit.
 - **Distro suite maintenance:** refreshed the Alpine 3.21/3.22 image versions.
 
+
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption
   that CRAN's framework build links `libomp` itself. It does not: `libR.dylib`

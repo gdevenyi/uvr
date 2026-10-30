@@ -372,11 +372,12 @@ fn hint_for(msg: &str) -> Option<String> {
         Some(
             "The download does not match the SHA-256 pinned in this uvr release, so uvr \
              did not install it: the tarball was tampered with, or GitHub regenerated it. \
-             Please report this at https://github.com/nbafrank/uvr/issues. To go on, \
-             install the companion from R with \
+             Please report this at https://github.com/nbafrank/uvr/issues. To go on without \
+             the companion, run the command again with --no-companion (or set \
+             UVR_NO_COMPANION=1). To install it by hand, use \
              remotes::install_github(\"nbafrank/uvr-r\", lib = .libPaths()[1]); uvr then \
-             skips its own download. If this was `uvr init` or `uvr import`, the project \
-             files are already written.",
+             skips its own download. If this was `uvr init`, the project files are already \
+             written. `uvr import` finished its other steps before this error.",
         )
     } else if m.contains("not inside a uvr project") {
         Some("Run `uvr init` to create uvr.toml in this directory.")
@@ -466,6 +467,8 @@ mod tests {
                    expected: 1bc6\nactual:   dead";
         let hint = hint_for(msg).expect("checksum failure should carry a hint");
         assert!(hint.contains("remotes::install_github"), "{hint}");
+        assert!(hint.contains("--no-companion"), "{hint}");
+        assert!(hint.contains("UVR_NO_COMPANION=1"), "{hint}");
     }
 
     #[test]

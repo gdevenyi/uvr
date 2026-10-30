@@ -81,11 +81,10 @@ Pure tracking section — fixes and small features land here between tags.
   and a hash, so a fresh download that does not match means the bytes were
   tampered with (or GitHub regenerated the archive); `uvr init`,
   `uvr import` and `uvr sync` now stop there and print the URL, the
-  expected and actual hashes, and how to install the companion from R
-  instead. A mismatching cached tarball is still deleted and downloaded
-  again, and network failures, `R CMD INSTALL` failures and the missing
-  `Meta/package.rds` check still only warn.
-
+  expected and actual hashes, and how to go on with `--no-companion` or
+  install the companion from R. A mismatching cached tarball is still
+  deleted and downloaded again, and network failures, `R CMD INSTALL` failures
+  and the missing `Meta/package.rds` check still only warn.
 
 ## v0.4.8 (2026-10-22)
 
@@ -470,6 +469,7 @@ Two changes may need action:
   substitutes a same-name registry binary for a GitHub, GitLab, or Forgejo
   dependency, and it checks installed and cached packages against the commit.
 - **Distro suite maintenance:** refreshed the Alpine 3.21/3.22 image versions.
+
 
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption

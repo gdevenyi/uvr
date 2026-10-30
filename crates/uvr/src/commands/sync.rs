@@ -1805,12 +1805,10 @@ pub fn ensure_companion_package(
                 return Ok(());
             }
             Err(e) => {
-                // Force re-download on next attempt — wipe the cached tarball
-                // regardless of hash, since any failure here means the cached
-                // file is suspect (wrong hash, truncated, corrupted).
-                let _ = std::fs::remove_file(&tarball);
                 // A cached mismatch can be local corruption and gets the
                 // retry; bytes GitHub just served for a pinned SHA cannot.
+                // Those bytes never reached the cache, so a tarball there now
+                // came from another process and stays.
                 if let CompanionError::ChecksumMismatch {
                     expected,
                     actual,
@@ -1822,6 +1820,10 @@ pub fn ensure_companion_package(
                     )
                     .context("The uvr R companion package download failed its SHA-256 check"));
                 }
+                // Force re-download on next attempt — wipe the cached tarball
+                // regardless of hash, since any failure here means the cached
+                // file is suspect (wrong hash, truncated, corrupted).
+                let _ = std::fs::remove_file(&tarball);
                 last_err = Some(e.to_string());
                 if attempt == 0 {
                     tracing::debug!("Companion install attempt 1 failed: {e}; retrying");
@@ -1869,11 +1871,11 @@ fn try_install_companion(
             .into();
         let resp = agent.get(url).header("User-Agent", "uvr").call()?;
         let bytes = resp.into_body().read_to_vec()?;
-        std::fs::write(tarball, &bytes)?;
+        publish_companion_bytes(&bytes, tarball, COMPANION_HASH)?;
+    } else {
+        // Verify SHA-256 checksum on every run (cache could be corrupted or tampered with).
+        verify_companion_bytes(&std::fs::read(tarball)?, COMPANION_HASH, false)?;
     }
-
-    // Verify SHA-256 checksum on every run (cache could be corrupted or tampered with).
-    verify_companion_bytes(&std::fs::read(tarball)?, COMPANION_HASH, fresh)?;
 
     // R CMD INSTALL can take a tarball directly — it extracts, finds the
     // package dir by DESCRIPTION, and installs to --library. The GitHub
@@ -1895,6 +1897,23 @@ fn try_install_companion(
         )));
     }
 
+    Ok(())
+}
+
+/// Check downloaded bytes, then move them into the cache in one step. The
+/// check reads this process's own bytes, and the rename means no process sees
+/// a partial file: on a shared `UVR_CACHE_DIR`, a concurrent write must not
+/// look like tampering.
+fn publish_companion_bytes(
+    bytes: &[u8],
+    tarball: &std::path::Path,
+    expected: &'static str,
+) -> std::result::Result<(), CompanionError> {
+    verify_companion_bytes(bytes, expected, true)?;
+    let dir = tarball.parent().unwrap_or(std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(&mut tmp, bytes)?;
+    tmp.persist(tarball).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -2819,6 +2838,41 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
             // Fall back to empty if somehow missing.
             String::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod companion_cache_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn publish_companion_bytes_writes_only_verified_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tarball = tmp.path().join("uvr-r.tar.gz");
+
+        // A bad download leaves no file behind, and no temporary file.
+        let err = publish_companion_bytes(b"bad", &tarball, "0000").unwrap_err();
+        assert!(matches!(
+            err,
+            CompanionError::ChecksumMismatch { fresh: true, .. }
+        ));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+
+        let hash: &'static str = hex::encode(Sha256::digest(b"good")).leak();
+        publish_companion_bytes(b"good", &tarball, hash).unwrap();
+        assert_eq!(std::fs::read(&tarball).unwrap(), b"good");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn publish_companion_bytes_keeps_a_tarball_from_another_process() {
+        // #162: the failed check must not touch what another uvr published.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tarball = tmp.path().join("uvr-r.tar.gz");
+        std::fs::write(&tarball, b"theirs").unwrap();
+        assert!(publish_companion_bytes(b"bad", &tarball, "0000").is_err());
+        assert_eq!(std::fs::read(&tarball).unwrap(), b"theirs");
     }
 }
 

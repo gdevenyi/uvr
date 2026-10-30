@@ -77,7 +77,8 @@ Pure tracking section — fixes and small features land here between tags.
   an image being built has none of it yet, so filtering against the current
   host is the wrong question. Linux-only, like the check it wraps.
 - **`uvr r pin --global` sets a per-user default R, and `UVR_R_VERSION`
-  overrides the R for every command** (#329). The closest thing was a
+  overrides the R for every command that selects one** (#329). The closest
+  thing was a
   `~/.r-version`, which beat project constraints and was not seen outside
   `$HOME`. The global pin lives in `~/.config/uvr/.r-version` (`XDG_CONFIG_HOME`
   is honoured; `%APPDATA%\uvr` on Windows), applies where no project pin does,

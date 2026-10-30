@@ -104,6 +104,12 @@ async fn run() -> Result<()> {
 
     match command {
         Commands::Init(args) => {
+            // `init` skips the companion and the IDE settings if it finds no R.
+            // That is wrong if the user named an R that is not there. Check
+            // before it writes a file. A bare project selects no R.
+            if !args.bare {
+                commands::util::require_r_version_override()?;
+            }
             let ide = ide::Ide::resolve(args.ide, args.no_ide);
             commands::init::run(args.name, args.here, args.r_version, ide, args.bare)?;
         }

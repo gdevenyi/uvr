@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -110,7 +110,7 @@ pub async fn run(
                 r_binary.display()
             )
         })?;
-        Some(ensure_with_env(&deps, &r_ver).await?)
+        Some(ensure_with_env(&deps, &r_binary, &r_ver).await?)
     };
 
     let (library, with_library) = match with_env {
@@ -351,7 +351,15 @@ fn with_env_key(packages: &[String], r_version: &str) -> String {
 
 /// Ensure the `--with` and header dependencies are installed in a cached
 /// environment. Returns the path to the cached library directory.
-async fn ensure_with_env(deps: &[(String, DependencySpec)], r_version: &str) -> Result<PathBuf> {
+///
+/// `r_binary` is the R that will run the script, and `r_version` is its
+/// version. The packages must be built by that R, because the cache key promises
+/// it (#160). The temporary manifest below does not say which R that is.
+async fn ensure_with_env(
+    deps: &[(String, DependencySpec)],
+    r_binary: &Path,
+    r_version: &str,
+) -> Result<PathBuf> {
     // Same package from the header and `--with` (or listed twice) is one
     // logical set — without this it would mint a second cache dir and
     // install everything again.
@@ -435,9 +443,16 @@ async fn ensure_with_env(deps: &[(String, DependencySpec)], r_version: &str) -> 
     // instead, and the script then fails because `lib_dir`, which is what
     // R is actually pointed at, stays empty. Nothing prunes the shared
     // library afterwards either, so the stray packages accumulate.
-    let lockfile = crate::commands::lock::resolve_and_lock(&project, false).await?;
-    crate::commands::sync::install_from_lockfile(&project, &lockfile, 4, Some(&lib_dir), None)
-        .await?;
+    let lockfile = crate::commands::lock::resolve_and_lock_for_r(&project, r_binary).await?;
+    crate::commands::sync::install_from_lockfile_for_r(
+        &project,
+        &lockfile,
+        4,
+        Some(&lib_dir),
+        r_binary,
+        r_version,
+    )
+    .await?;
 
     Ok(lib_dir)
 }

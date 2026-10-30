@@ -206,7 +206,7 @@ pub fn r_install_dir() -> Option<PathBuf> {
 
 /// UVR_R_VERSION
 ///
-/// Selects the R for every command, above a project's `.r-version` (#329). It
+/// Selects the R for every command that uses one, above a project's `.r-version` (#329). It
 /// is the environment form of `uvr run --r-version`, and takes the same
 /// values: `4.5`, `4.5.3` or a constraint like `>=4.4`. If no installed R
 /// matches, the command fails: this variable has no fallback, and it does not

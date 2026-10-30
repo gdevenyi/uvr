@@ -549,16 +549,18 @@ uvr r pin --global 4.5
 uvr selects R with the first of these rules that applies:
 
 0. `UVR_R_VERSION`, when set: `4.5`, `4.5.3` or a constraint like `>=4.4`. It
-   overrides everything below for every command, and a command fails if no
-   installed R matches. `uvr run --r-version` outranks it, and it never
-   downloads an R.
+   overrides everything below for every command that selects an R, and that
+   command fails if no installed R matches. This includes `uvr init`, except
+   with `--bare`. Commands that select no R, such as `uvr r install`, ignore it.
+   `uvr run --r-version` outranks it, also when it installs packages, and it
+   never downloads an R.
 1. A `.r-version` in the working directory or a parent.
 2. The global pin, `$XDG_CONFIG_HOME/uvr/.r-version` or
    `~/.config/uvr/.r-version` (`%APPDATA%\uvr\.r-version` on Windows). The
    global pin is a preference: it is used only if it satisfies the `uvr.toml`
    constraint or a script's `r`, and `uvr run --r-version` ignores it. If it is
-   not installed, uvr warns and goes on to the next rule. `4.5` selects the
-   newest installed 4.5.x, and `4.5.3` selects exactly that one.
+   not installed or does not work, uvr warns and goes on to the next rule. `4.5`
+   selects the newest installed 4.5.x, and `4.5.3` selects exactly that one.
 3. The newest installed R that satisfies the `uvr.toml` constraint.
 4. The newest installed R.
 

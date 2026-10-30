@@ -278,6 +278,9 @@ fn newest_working(
 }
 
 fn installed_versions(installations: &[RInstallation]) -> String {
+    if installations.is_empty() {
+        return "none".to_string();
+    }
     installations
         .iter()
         .map(|i| i.version.as_str())
@@ -330,10 +333,18 @@ fn select_global_pin(installations: &[RInstallation], constraint: Option<&str>) 
         }
         return None;
     }
-    newest_working(installations, |inst| {
+    let usable = |inst: &RInstallation| {
         is_pinned(inst)
             && constraint.is_none_or(|c| r_version_satisfies(c, &inst.version).unwrap_or(false))
-    })
+    };
+    let selected = newest_working(installations, usable);
+    if selected.is_none() && installations.iter().any(usable) {
+        warn(format!(
+            "The global R pin {pin} is installed but does not work (no version response), so \
+             it is not used. Reinstall it, or clear it with `uvr r pin --global --unset`."
+        ));
+    }
+    selected
 }
 
 fn resolve_r_binary(
@@ -342,16 +353,17 @@ fn resolve_r_binary(
 ) -> Result<(PathBuf, RSource)> {
     let installations = find_all();
 
-    if installations.is_empty() {
-        return Err(UvrError::RNotFound);
-    }
-
-    // 0. UVR_R_VERSION overrides every rule below.
+    // 0. UVR_R_VERSION overrides every rule below. Its error names the variable,
+    // also if there is no R at all.
     if rules.env_override {
         if let Some(wanted) = crate::env_vars::r_version() {
             return select_env_override(&installations, &wanted)
                 .map(|bin| (bin, RSource::EnvOverride));
         }
+    }
+
+    if installations.is_empty() {
+        return Err(UvrError::RNotFound);
     }
 
     // 1. Honour .r-version exact pin
@@ -406,15 +418,9 @@ fn resolve_r_binary(
         }) {
             return Ok((bin, RSource::Constraint));
         }
-        let installed = installed_versions(&installations);
-        let installed = if installed.is_empty() {
-            "none".to_string()
-        } else {
-            installed
-        };
         return Err(UvrError::RVersionUnsatisfied {
             constraint: constraint.to_string(),
-            installed,
+            installed: installed_versions(&installations),
         });
     }
 
@@ -901,8 +907,9 @@ mod tests {
 
     #[test]
     fn find_r_binary_impossible_constraint() {
-        // A constraint for R 99.0.0 should fail (no such version exists)
-        let result = find_r_binary(Some(">=99.0.0"));
+        // A constraint for R 99.0.0 should fail (no such version exists). This
+        // function reads no `UVR_R_VERSION` or pin from the developer's machine.
+        let result = find_r_binary_satisfying(">=99.0.0");
         if !find_all().is_empty() {
             assert!(result.is_err());
         }

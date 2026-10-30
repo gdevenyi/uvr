@@ -351,6 +351,9 @@ fn r_profile_user_in(r_home_dir: Option<PathBuf>) -> PathBuf {
     r_home_dir
         .map(|h| h.join(".Rprofile"))
         .filter(|p| p.is_file())
+        // A project in the home directory: this file is the project's, and
+        // its block would put the project library ahead of a script's own.
+        .filter(|p| !std::fs::read_to_string(p).is_ok_and(|s| s.contains("# >>> uvr >>>")))
         .unwrap_or(null_device)
 }
 
@@ -624,6 +627,11 @@ mod tests {
         env::set_var("R_PROFILE_USER", "omp.Rprofile");
         assert_eq!(resolve(), env::current_dir().unwrap().join("omp.Rprofile"));
         env::remove_var("R_PROFILE_USER");
+
+        // Opted in, but `~/.Rprofile` holds uvr's block (a project in the home
+        // directory): it is the project's profile, so not this one.
+        std::fs::write(&profile, "# >>> uvr >>>\n# <<< uvr <<<\n").unwrap();
+        assert_eq!(resolve(), null_device);
 
         // Opted in, but no profile to load: still the null device, never
         // unset (R would fall back to the project's `./.Rprofile`).

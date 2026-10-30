@@ -213,12 +213,13 @@ local({
 // #309 churn) and a teammate without the switch does not strip them again.
 // They sit after the paths are anchored to the project (a `setwd()` in the
 // profile must not move them) and before `.libPaths()`, so the project
-// library still ends up first.
+// library still ends up first. `source`, not `sys.source`: that one restores
+// `keep.source` on exit, so the option would not survive from the profile.
 const RPROFILE_USER_PROFILE_ANCHOR: &str = "  rver_file <- file.path(getwd(), \".r-version\")\n";
 const RPROFILE_USER_PROFILE: &str = r#"  if (Sys.getenv("UVR_USER_PROFILE") %in% c("1", "true", "yes", "TRUE", "YES")) {
     user <- normalizePath("~/.Rprofile", mustWork = FALSE)
     if (file.exists(user) && user != normalizePath(".Rprofile", mustWork = FALSE))
-      try(sys.source(user, envir = globalenv()))
+      try(source(user, local = globalenv()))
   }
 "#;
 
@@ -610,6 +611,8 @@ mod rprofile_tests {
         let lib_paths = on.find(".libPaths(").unwrap();
         assert!(anchored < opt_in && opt_in < lib_paths);
         assert!(on.contains(r#"normalizePath("~/.Rprofile""#));
+        assert!(on.contains("source(user, local = globalenv())"));
+        assert!(!on.contains("sys.source"));
         // The R side accepts the same values as `env_vars::truthy`.
         assert!(on.contains(r#"%in% c("1", "true", "yes", "TRUE", "YES")"#));
     }

@@ -60,8 +60,13 @@ impl Platform {
     /// any non-macOS R — falls back to [`Platform::detect`].
     pub fn of_r(r_binary: &Path) -> Result<Self> {
         let arch = std::fs::canonicalize(r_binary).ok().and_then(|bin| {
-            let libr = bin.parent()?.parent()?.join("lib").join("libR.dylib");
-            crate::installer::binary_install::macho_arch(&libr)
+            let root = bin.parent()?.parent()?;
+            crate::installer::binary_install::macho_arch(&root.join("lib").join("libR.dylib"))
+                .or_else(|| {
+                    crate::installer::binary_install::macho_arch(
+                        &root.join("lib").join("R").join("lib").join("libR.dylib"),
+                    )
+                })
         });
         match arch {
             Some(arch) => Ok(Self::compiled()?.with_arch(arch)),
@@ -550,12 +555,11 @@ fn host_triple_from_os_release(content: Option<&str>, platform: Platform) -> Hos
     }
 }
 
-/// Detect the host triple by reading `/etc/os-release` and combining with
-/// `Platform::detect()`. Used at sync time to construct the UA and match
-/// `Built:` fields.
-pub fn host_triple() -> HostTriple {
+/// Detect the host triple by reading `/etc/os-release` for the given `platform`
+/// (caller-supplied: use [`Platform::of_r`] when matching packages for an R
+/// installation).
+pub fn host_triple(platform: Platform) -> HostTriple {
     let content = std::fs::read_to_string("/etc/os-release").ok();
-    let platform = Platform::detect().unwrap_or(Platform::LinuxX86_64);
     host_triple_from_os_release(content.as_deref(), platform)
 }
 
@@ -1403,6 +1407,16 @@ mod tests {
             let arch = if cfg!(windows) { "x86_64" } else { arch };
             assert_eq!(got.arch(), arch);
             assert_eq!(got.is_macos(), Platform::compiled().unwrap().is_macos());
+
+            // Non-framework macOS layout (`--enable-R-framework=no`, Nix, MacPorts):
+            // `<prefix>/lib/R/lib/libR.dylib`.
+            let non_fw = TempDir::new().unwrap();
+            std::fs::create_dir_all(non_fw.path().join("bin")).unwrap();
+            std::fs::create_dir_all(non_fw.path().join("lib/R/lib")).unwrap();
+            std::fs::write(non_fw.path().join("bin/R"), "#!/bin/sh\n").unwrap();
+            std::fs::write(non_fw.path().join("lib/R/lib/libR.dylib"), header).unwrap();
+            let got_non_fw = Platform::of_r(&non_fw.path().join("bin/R")).unwrap();
+            assert_eq!(got_non_fw.arch(), arch);
         }
         // No libR.dylib (any non-macOS R): falls back to `detect()`.
         let home = TempDir::new().unwrap();

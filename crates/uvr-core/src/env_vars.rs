@@ -233,17 +233,19 @@ pub fn r_downloads_allowed() -> crate::error::Result<bool> {
 /// `aarch64`) or `x86_64`. Unset, uvr uses the machine's architecture — on an
 /// Apple Silicon Mac that is arm64 even when uvr itself is an x86_64 build
 /// running under Rosetta 2 (#155); set `x86_64` to install Intel R there.
-/// Other values are ignored. Returned in Rust's vocabulary (`aarch64` /
-/// `x86_64`).
+/// Other values log a warning and are ignored. Returned in Rust's vocabulary
+/// (`aarch64` / `x86_64`).
 pub fn r_arch() -> Option<&'static str> {
-    match read_env_var("UVR_R_ARCH")?
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let raw = read_env_var("UVR_R_ARCH")?;
+    match raw.trim().to_ascii_lowercase().as_str() {
         "arm64" | "aarch64" => Some("aarch64"),
         "x86_64" => Some("x86_64"),
-        _ => None,
+        _ => {
+            tracing::warn!(
+                "Ignoring unknown UVR_R_ARCH={raw:?}; expected `arm64`, `aarch64`, or `x86_64`"
+            );
+            None
+        }
     }
 }
 

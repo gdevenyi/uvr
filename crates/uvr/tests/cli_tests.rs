@@ -1450,12 +1450,15 @@ fn test_sync_after_cache_prune_still_hits_the_cache() {
     } else {
         "libR.so"
     });
+    let r_arch = uvr_core::r_version::downloader::Platform::of_r(&r_bin)
+        .unwrap()
+        .arch();
     let key = uvr_core::installer::package_cache::cache_key(
         "fakepkg",
         "1.0",
         Some("md5:0123"),
         "4.5",
-        std::env::consts::ARCH,
+        r_arch,
         false,
         Some(&libr),
         None,

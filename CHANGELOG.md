@@ -89,8 +89,9 @@ Pure tracking section — fixes and small features land here between tags.
   the R architecture when it differs from uvr's. Existing installs are not
   replaced (`uvr r install` warns when it keeps one); to move one to arm64,
   `uvr r uninstall <ver> && uvr r install <ver>`, then delete each affected
-  project's `.uvr/library/` before its next `uvr sync` (sync does not yet
-  notice packages built for the other architecture). `uvr upgrade` still
+  project's `.uvr/library/` before its next `uvr sync` (and run `uvr cache
+  clean` if `uvr run --with` or script headers cached Intel packages under
+  `with-envs/`). `uvr upgrade` still
   fetches the uvr build you already run.
 
 ## v0.4.8 (2026-10-22)

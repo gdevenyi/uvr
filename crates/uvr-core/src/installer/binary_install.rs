@@ -1792,4 +1792,37 @@ mod tests {
         verify_mach_o_arch_in_libs(&pkg_dir, "pkg", std::env::consts::ARCH)
             .expect("non-.so files should be ignored");
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn arch_check_validates_explicit_cross_arch_r_targets() {
+        let dir = TempDir::new().unwrap();
+        for (cpu, ok_arch, bad_arch) in [
+            (CPU_TYPE_ARM64, "aarch64", "x86_64"),
+            (CPU_TYPE_X86_64, "x86_64", "aarch64"),
+        ] {
+            let pkg_dir = dir.path().join(format!("pkg-{ok_arch}"));
+            let libs = pkg_dir.join("libs");
+            std::fs::create_dir_all(&libs).unwrap();
+            write_thin_macho_so(&libs.join("pkg.so"), cpu);
+            verify_mach_o_arch_in_libs(&pkg_dir, "pkg", ok_arch)
+                .expect("matching explicit r_arch should pass");
+            verify_mach_o_arch_in_libs(&pkg_dir, "pkg", bad_arch)
+                .expect_err("opposite explicit r_arch should fail");
+        }
+    }
+
+    #[test]
+    fn macho_arch_reads_arm64_and_x86_64_headers() {
+        let dir = TempDir::new().unwrap();
+        let arm = dir.path().join("arm.dylib");
+        let intel = dir.path().join("intel.dylib");
+        let other = dir.path().join("other.bin");
+        std::fs::write(&arm, [0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01]).unwrap();
+        std::fs::write(&intel, [0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01]).unwrap();
+        std::fs::write(&other, b"not-macho").unwrap();
+        assert_eq!(macho_arch(&arm), Some("aarch64"));
+        assert_eq!(macho_arch(&intel), Some("x86_64"));
+        assert_eq!(macho_arch(&other), None);
+    }
 }

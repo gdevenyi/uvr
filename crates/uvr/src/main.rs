@@ -356,14 +356,34 @@ fn hint_for(msg: &str) -> Option<String> {
         ));
     }
     if let Some((package_dir, library)) = unloadable_shared_object(msg) {
+        let pkg_name = std::path::Path::new(package_dir)
+            .file_name()
+            .and_then(|s| s.to_str());
+        let is_shipped_r_pkg = package_dir.contains("/lib/R/library/")
+            || package_dir.contains("/lib64/R/library/")
+            || pkg_name.is_some_and(uvr_core::resolver::is_base_package);
+        if is_shipped_r_pkg {
+            return Some(format!(
+                "R could not load the compiled code in {package_dir}: the system library \
+                 `{library}` was not found. Install the system package that provides \
+                 `{library}`."
+            ));
+        }
+        let quoted_dir = shell_quote_if_needed(package_dir);
+        let clean_step = match pkg_name.filter(|n| uvr_core::package_name::is_valid(n)) {
+            Some(pkg) => {
+                format!("`uvr cache clean --package {pkg}` and `rm -rf {quoted_dir}`")
+            }
+            None => format!("`rm -rf {quoted_dir}`"),
+        };
         return Some(format!(
             "R could not load the compiled code in {package_dir}: the system library \
              `{library}` was not found. A Linux binary package links the system libraries \
              of the distribution that uvr detects. Install the system package that \
-             provides `{library}`, or build this package from source: \
-             `rm -rf {package_dir}`, then run the command again with `UVR_NO_BINARY=1`. \
-             An R from Nix (devbox, for example) does not search the host's library \
-             directories, so with that R a source build is usually the fix."
+             provides `{library}`, or build this package from source: run {clean_step}, \
+             then run the command again with `UVR_NO_BINARY=1`. An R from Nix (devbox, \
+             for example) does not search the host's library directories, so with that R \
+             remove `.uvr/library` and rebuild from source with `UVR_NO_BINARY=1`."
         ));
     }
     let m = msg.to_ascii_lowercase();
@@ -423,6 +443,18 @@ fn hint_for(msg: &str) -> Option<String> {
     hint.map(String::from)
 }
 
+fn shell_quote_if_needed(path: &str) -> String {
+    let safe = !path.is_empty()
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'));
+    if safe {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', r"'\''"))
+    }
+}
+
 /// The package directory and the missing system library from R's dlopen
 /// failure on Linux (#270):
 ///
@@ -436,18 +468,35 @@ fn hint_for(msg: &str) -> Option<String> {
 fn unloadable_shared_object(msg: &str) -> Option<(&str, &str)> {
     const LOAD: &str = "unable to load shared object '";
     const MISSING: &str = ": cannot open shared object file";
-    let object = &msg[msg.find(LOAD)? + LOAD.len()..];
-    let (object, rest) = object.split_once('\'')?;
-    let package_dir = &object[..object.rfind("/libs/")?];
-    // The word just before the loader's text; R puts it on the next line.
-    let library = rest[..rest.find(MISSING)?]
-        .split_whitespace()
-        .last()?
-        .trim_start_matches(':');
-    if library.is_empty() || library.contains('/') {
-        return None;
+    for chunk in msg.split(LOAD).skip(1) {
+        let mut lines = chunk.lines();
+        let Some(object) = lines.next().and_then(|l| l.strip_suffix("':")) else {
+            continue;
+        };
+        let Some(libs_pos) = object.rfind("/libs/") else {
+            continue;
+        };
+        let package_dir = &object[..libs_pos];
+        // The word just before the loader's text; R puts it on the next line.
+        let Some(dlerror) = lines.next() else {
+            continue;
+        };
+        let Some(missing_pos) = dlerror.find(MISSING) else {
+            continue;
+        };
+        let Some(library) = dlerror[..missing_pos]
+            .split_whitespace()
+            .last()
+            .map(|s| s.trim_start_matches(':'))
+        else {
+            continue;
+        };
+        if library.is_empty() || library.contains('/') {
+            continue;
+        }
+        return Some((package_dir, library));
     }
-    Some((package_dir, library))
+    None
 }
 
 /// The `-std=` flag a compiler refused, from gcc's "unrecognized
@@ -533,11 +582,40 @@ mod tests {
         let hint = hint_for(msg).expect("an unloadable binary should carry a hint");
         assert!(hint.contains("`libicui18n.so.74`"), "{hint}");
         assert!(
+            hint.contains("`uvr cache clean --package stringi`"),
+            "{hint}"
+        );
+        assert!(
             hint.contains("`rm -rf /home/jared/p/.uvr/library/stringi`"),
             "{hint}"
         );
         assert!(hint.contains("UVR_NO_BINARY=1"), "{hint}");
         assert!(hint.contains("Nix"), "{hint}");
+    }
+
+    #[test]
+    fn shared_object_hint_quotes_paths_and_pairs_each_dlopen_block() {
+        let msg = "unable to load shared object '/p/.uvr/library/first/libs/first.so':\n  \
+                   /p/.uvr/library/first/libs/first.so: undefined symbol: foo_bar\n\
+                   unable to load shared object '/home/o'neil/My Projects/.uvr/library/stringi/libs/stringi.so':\n  \
+                   libicui18n.so.74: cannot open shared object file: No such file or directory";
+        let hint = hint_for(msg).expect("second dlopen block should carry a hint");
+        assert!(!hint.contains("first"), "{hint}");
+        assert!(
+            hint.contains("`rm -rf '/home/o'\\''neil/My Projects/.uvr/library/stringi'`"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn shipped_r_library_gets_system_library_hint_without_rm_rf() {
+        let msg =
+            "unable to load shared object '/opt/R/4.5.1/lib/R/library/tcltk/libs/tcltk.so':\n  \
+                   libtk8.6.so: cannot open shared object file: No such file or directory";
+        let hint = hint_for(msg).expect("shipped R package should still name the missing library");
+        assert!(hint.contains("`libtk8.6.so`"), "{hint}");
+        assert!(!hint.contains("rm -rf"), "{hint}");
+        assert!(!hint.contains("UVR_NO_BINARY"), "{hint}");
     }
 
     #[test]

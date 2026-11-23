@@ -81,7 +81,7 @@ Pure tracking section — fixes and small features land here between tags.
   `dependencies = TRUE`, so its one-package jsonlite stage also installed the
   Suggests tree: 65 lockfile entries, not 1. The issue reported ~549s per run
   for that stage; one cold run in the bench image now takes 1.60s, which also
-  includes the mirror fix in f089a01.
+  includes the v0.4.7 mirror fix.
   `BENCH_EXTENDED=1 bash benchmarks/run-in-docker.sh` now reaches the stage;
   the wrapper did not pass the variable to the container.
 

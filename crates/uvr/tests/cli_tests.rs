@@ -3927,3 +3927,20 @@ fn test_scan_add_ignores_the_project_itself() {
         .success()
         .stdout(predicate::str::contains("are declared in uvr.toml"));
 }
+
+#[test]
+fn test_scan_add_requires_uvr_toml_when_only_description_exists() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("DESCRIPTION"),
+        "Package: descproj\nVersion: 0.1.0\nImports: jsonlite\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("code.R"), "library(jsonlite)\n").unwrap();
+    uvr_cmd()
+        .args(["scan", "--add"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("uvr init --here"));
+}

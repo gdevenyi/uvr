@@ -37,6 +37,17 @@ use crate::ui::palette;
 /// resolver support and is not this change.
 pub async fn run(all: bool, add: bool) -> Result<()> {
     let project = Project::find_cwd().context("Not inside a uvr project")?;
+    if add
+        && matches!(
+            project.manifest_source,
+            uvr_core::project::ManifestSource::Description
+        )
+    {
+        anyhow::bail!(
+            "Found DESCRIPTION without uvr.toml — `uvr scan --add` writes to uvr.toml. \
+             Run `uvr init --here` first, then re-run `uvr scan --add`."
+        );
+    }
     let manifest_deps: BTreeSet<String> = project
         .manifest
         .dependencies
@@ -332,14 +343,12 @@ struct PackageDetector {
 
 impl PackageDetector {
     fn new() -> Self {
-        // `library(pkg)` and `require(pkg)`. The package may be quoted
-        // (`library("pkg")`) or bare (`library(pkg)`) — R accepts both
-        // because `library()` uses NSE. `requireNamespace` and
-        // `loadNamespace` use the same convention.
-        let library_or_require = Regex::new(
-            r#"\b(?:library|require|requireNamespace|loadNamespace)\s*\(\s*(["']?)([A-Za-z][A-Za-z0-9._]*)["']?([^)]*)"#,
-        )
-        .expect("library/require regex compiles");
+        // `library(pkg)` and `require(pkg)` accept bare or quoted names via
+        // NSE; `requireNamespace("pkg")` and `loadNamespace("pkg")` evaluate
+        // their first argument normally so only quoted literals name a package.
+        let library_or_require =
+            Regex::new(r"\b(library|require|requireNamespace|loadNamespace)\s*\(")
+                .expect("library/require regex compiles");
 
         // `pkg::fn` / `pkg:::fn`. Word-boundary on the left avoids matching
         // inside identifiers; the package name follows R's allowed chars.
@@ -384,15 +393,17 @@ impl PackageDetector {
     fn extract(&self, content: &str) -> BTreeSet<String> {
         let mut found = BTreeSet::new();
         let code = strip_comments(content);
+        let decommented = strip_comments_and_strings(content);
         for cap in self.library_or_require.captures_iter(&code) {
-            // `library(p, character.only = TRUE)` names a variable, not a
-            // package. A quoted first argument is still a literal name.
-            if cap[1].is_empty() && cap[3].contains("character.only") {
-                continue;
+            let fn_name = &cap[1];
+            let start = cap.get(0).expect("full match").end();
+            if let Some(pkg) = extract_package_from_call(fn_name, &code[start..]) {
+                found.insert(pkg);
             }
-            found.insert(cap[2].to_string());
         }
-        for cap in self.namespace_op.captures_iter(&code) {
+        // Scan `::` / `:::` with strings blanked too, so SQL casts
+        // (`"SELECT id::text"`) and C++ strings (`"std::max"`) do not match.
+        for cap in self.namespace_op.captures_iter(&decommented) {
             if let Some(name) = cap.get(1) {
                 found.insert(name.as_str().to_string());
             }
@@ -406,7 +417,6 @@ impl PackageDetector {
         // Scan `box::use` on comment-stripped source so a commented-out
         // import block can't sweep the live code after it into the
         // argument list. Strings go too, so `"box::use(x)"` is no import.
-        let decommented = strip_comments_and_strings(content);
         for cap in self.box_use.captures_iter(&decommented) {
             if let Some(args) = cap.get(1) {
                 for spec in self.box_use_spec.captures_iter(args.as_str()) {
@@ -424,6 +434,157 @@ impl PackageDetector {
     }
 }
 
+fn is_scanned_pkg_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_'))
+}
+
+fn balanced_paren_slice(s: &str) -> Option<&str> {
+    let mut depth = 1usize;
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in s.char_indices() {
+        if let Some(q) = in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => in_quote = Some(ch),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[..idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(args: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in args.char_indices() {
+        if let Some(q) = in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => in_quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&args[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&args[start..]);
+    parts
+}
+
+fn split_named_arg(arg: &str) -> Option<(&str, &str)> {
+    let bytes = arg.as_bytes();
+    let mut depth = 0usize;
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in arg.char_indices() {
+        if let Some(q) = in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => in_quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => {
+                let prev = idx.checked_sub(1).and_then(|p| bytes.get(p)).copied();
+                let next = bytes.get(idx + 1).copied();
+                if matches!(prev, Some(b'=' | b'!' | b'<' | b'>')) || next == Some(b'=') {
+                    continue;
+                }
+                let name = arg[..idx].trim();
+                if is_scanned_pkg_ident(name) {
+                    return Some((name, arg[idx + 1..].trim()));
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn extract_package_from_call(fn_name: &str, after_open_paren: &str) -> Option<String> {
+    let args = balanced_paren_slice(after_open_paren)?;
+    let mut pkg_expr: Option<&str> = None;
+    let mut first_positional: Option<&str> = None;
+    let mut char_only = false;
+
+    for raw_arg in split_top_level_commas(args) {
+        let trimmed = raw_arg.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((name, val)) = split_named_arg(trimmed) {
+            match name {
+                // `library(help = stats)` displays help and loads nothing.
+                "help" => return None,
+                "character.only" => {
+                    char_only = !matches!(val, "FALSE" | "F");
+                }
+                "package" => pkg_expr = Some(val),
+                _ => {}
+            }
+        } else if first_positional.is_none() {
+            first_positional = Some(trimmed);
+        }
+    }
+
+    let target = pkg_expr.or(first_positional)?;
+    if target.len() >= 2
+        && ((target.starts_with('"') && target.ends_with('"'))
+            || (target.starts_with('\'') && target.ends_with('\'')))
+    {
+        let inner = &target[1..target.len() - 1];
+        return is_scanned_pkg_ident(inner).then(|| inner.to_string());
+    }
+
+    // Only `library()` and `require()` use NSE on bare symbols.
+    if !matches!(fn_name, "library" | "require") || char_only {
+        return None;
+    }
+    if matches!(target, "TRUE" | "FALSE" | "T" | "F" | "NULL" | "NA") {
+        return None;
+    }
+    is_scanned_pkg_ident(target).then(|| target.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,7 +598,7 @@ library("dplyr")
 require(tidyr)
 require('data.table')
 requireNamespace("rlang")
-loadNamespace(stats)
+loadNamespace("stats")
 "#;
         let found = detector.extract(src);
         assert!(found.contains("ggplot2"));
@@ -566,13 +727,26 @@ box::use(
         let found = detector.extract(concat!(
             "for (p in pkgs) library(p, character.only = TRUE)\n",
             "require(q,\n  character.only = T)\n",
+            "library(r, lib.loc = .libPaths()[1], character.only = TRUE)\n",
+            "requireNamespace(ns_var, quietly = TRUE)\n",
+            "loadNamespace(ns_var2)\n",
+            "library(help = stats)\n",
+            "library(package = \"namedpkg\")\n",
+            "library(quietly = TRUE, package = barepkg)\n",
+            "sql <- \"SELECT id::text FROM items\"\n",
+            "cpp <- \"std::max(a, b)\"\n",
             "library(\"literal\", character.only = TRUE)\n",
             "library(plain, quietly = TRUE)\n",
         ));
         assert!(found.contains("literal"), "got {found:?}");
         assert!(found.contains("plain"), "got {found:?}");
-        assert!(!found.contains("p"), "got {found:?}");
-        assert!(!found.contains("q"), "got {found:?}");
+        assert!(found.contains("namedpkg"), "got {found:?}");
+        assert!(found.contains("barepkg"), "got {found:?}");
+        for skipped in [
+            "p", "q", "r", "ns_var", "ns_var2", "help", "package", "quietly", "id", "std",
+        ] {
+            assert!(!found.contains(skipped), "{skipped} leaked into {found:?}");
+        }
     }
 
     #[test]

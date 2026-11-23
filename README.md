@@ -364,7 +364,7 @@ upgrading a transitive package on its own.
 `--add` inherits `uvr add`'s behaviour, including its all-or-nothing rollback:
 if one scanned name does not resolve, nothing is written. A local package or
 one that lives on GitHub will do that — add those by hand with
-`uvr add user/repo` and re-run.
+`uvr add ../mypkg` or `uvr add user/repo` and re-run.
 
 ---
 

@@ -89,8 +89,8 @@ Pure tracking section — fixes and small features land here between tags.
   `/usr/local/bin`, `/opt/homebrew/bin`; on Windows `.local\bin` and
   `.cargo\bin` under `%USERPROFILE%`, and `%LOCALAPPDATA%\Programs\uvr`), so
   an R started from a GUI with a shorter `PATH` does not raise a false alarm.
-  Because the managed block changed, the next `uvr sync` / `uvr init` rewrites
-  it once in every existing project.
+  Because the managed block changed, the next `uvr sync` or `uvr import`
+  rewrites it once in every existing project.
 
 ## v0.4.8 (2026-10-22)
 

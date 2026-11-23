@@ -220,13 +220,15 @@ local({
     }
   }
   if (interactive()) {
-    # A file.exists() scan: Sys.which would start a process at every R start.
     win <- .Platform$OS.type == "windows"
-    dirs <- c(strsplit(Sys.getenv("PATH"), .Platform$path.sep, fixed = TRUE)[[1]],
-              file.path(Sys.getenv(if (win) "USERPROFILE" else "HOME"), c(".local", ".cargo"), "bin"),
-              if (win) file.path(Sys.getenv("LOCALAPPDATA"), "Programs", "uvr")
-              else c("/usr/local/bin", "/opt/homebrew/bin"))
-    if (!any(file.exists(file.path(dirs, if (win) "uvr.exe" else "uvr")))) {
+    home <- Sys.getenv(if (win) "USERPROFILE" else "HOME")
+    local_app <- if (win) Sys.getenv("LOCALAPPDATA") else ""
+    dirs <- c(Filter(nzchar, strsplit(Sys.getenv("PATH"), .Platform$path.sep, fixed = TRUE)[[1]]),
+              if (nzchar(home)) file.path(home, c(".local", ".cargo"), "bin"),
+              if (nzchar(local_app)) file.path(local_app, "Programs", "uvr")
+              else if (!win) c("/usr/local/bin", "/opt/homebrew/bin"))
+    bins <- file.path(dirs, if (win) "uvr.exe" else "uvr")
+    if (!any(file.exists(bins) & !dir.exists(bins))) {
       message("uvr: uvr command not found. ",
               if (nzchar(system.file(package = "uvr"))) "Run uvr::install_uvr(), or install it"
               else "Install it", if (win) " in PowerShell" else " in a terminal", " with:\n  ",
@@ -622,12 +624,18 @@ mod rprofile_tests {
         }
     }
 
-    /// Start R with `dir/.Rprofile` as the user profile and `path` as PATH,
-    /// and return what it wrote to stderr.
+    /// Start `r_bin` (interactive) or `rscript_bin` (batch) with `dir/.Rprofile`
+    /// as the user profile and `path` as PATH, and return what it wrote to stderr.
     #[cfg(unix)]
-    fn r_startup_stderr(dir: &Path, interactive: bool, path: &std::ffi::OsStr) -> String {
+    fn r_startup_stderr(
+        dir: &Path,
+        r_bin: &Path,
+        rscript_bin: &Path,
+        interactive: bool,
+        path: &std::ffi::OsStr,
+    ) -> String {
         let mut cmd = if interactive {
-            let mut c = std::process::Command::new("R");
+            let mut c = std::process::Command::new(r_bin);
             c.args([
                 "--interactive",
                 "--no-save",
@@ -637,7 +645,7 @@ mod rprofile_tests {
             ]);
             c
         } else {
-            let mut c = std::process::Command::new("Rscript");
+            let mut c = std::process::Command::new(rscript_bin);
             c.args(["-e", "invisible()"]);
             c
         };
@@ -646,26 +654,63 @@ mod rprofile_tests {
             .env("R_PROFILE_USER", dir.join(".Rprofile"))
             .env("HOME", dir)
             .env("PATH", path)
+            .env("R_LIBS", "")
+            .env("R_LIBS_USER", "")
+            .env("R_LIBS_SITE", "")
+            .env("R_ENVIRON", "")
+            .env("R_ENVIRON_USER", "")
+            .env_remove("UVR_LIBRARY")
+            .env_remove("R_HOME")
+            .env_remove("R_PROFILE")
             .stdin(std::process::Stdio::null())
             .output()
-            .expect("R is on PATH, so it must start");
+            .expect("probed R binary must start");
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(out.status.success(), "R failed: {stderr}");
         stderr
     }
 
+    #[cfg(unix)]
+    fn find_working_r_pair(
+        path: &std::ffi::OsStr,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let cwd = std::env::current_dir().ok();
+        let resolve = |bin_name: &str| {
+            std::env::split_paths(path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| match (&cwd, d.is_absolute()) {
+                    (Some(base), false) => base.join(d),
+                    _ => d,
+                })
+                .map(|d| d.join(bin_name))
+                .find(|candidate| {
+                    candidate.is_file()
+                        && std::process::Command::new(candidate)
+                            .arg("--version")
+                            .output()
+                            .is_ok_and(|o| o.status.success())
+                })
+        };
+        Some((resolve("R")?, resolve("Rscript")?))
+    }
+
     /// `path` with no `uvr` on it. A directory that holds `uvr` can also hold
-    /// `R` and the tools R's start script needs (`/usr/bin`, a conda `bin`), so
-    /// it is replaced by a directory under `scratch` that links everything else.
+    /// tools R's start script needs (`/usr/bin`, a conda `bin`), so it is
+    /// replaced by a directory under `scratch` that links everything else.
     #[cfg(unix)]
     fn path_without_uvr(path: &std::ffi::OsStr, scratch: &Path) -> std::ffi::OsString {
+        let cwd = std::env::current_dir().ok();
         let dirs = std::env::split_paths(path).enumerate().map(|(i, d)| {
-            if !d.join("uvr").exists() {
-                return d;
+            let abs = match (&cwd, d.is_absolute()) {
+                (Some(base), false) if !d.as_os_str().is_empty() => base.join(&d),
+                _ => d,
+            };
+            if !abs.join("uvr").exists() {
+                return abs;
             }
             let links = scratch.join(format!("path-{i}"));
             std::fs::create_dir(&links).unwrap();
-            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+            for entry in std::fs::read_dir(&abs).unwrap().flatten() {
                 if entry.file_name() != "uvr" {
                     std::os::unix::fs::symlink(entry.path(), links.join(entry.file_name()))
                         .unwrap();
@@ -688,9 +733,25 @@ mod rprofile_tests {
             eprintln!("skipping: a system-wide uvr is installed");
             return;
         }
+        let original = std::env::var_os("PATH").unwrap_or_default();
+        let Some((r_bin, rscript_bin)) = find_working_r_pair(&original) else {
+            eprintln!("skipping: no working R and Rscript on PATH");
+            return;
+        };
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         std::fs::write(dir.join(".Rprofile"), RPROFILE_SNIPPET).unwrap();
+        let without_uvr = path_without_uvr(&original, dir);
+
+        // Fresh clone without the companion package: direct terminal install hint.
+        let fresh_clone = r_startup_stderr(dir, &r_bin, &rscript_bin, true, &without_uvr);
+        assert!(
+            fresh_clone.contains(
+                "uvr: uvr command not found. Install it in a terminal with:\n  curl -fsSL https://raw.githubusercontent.com/nbafrank/uvr/main/install.sh | sh\n"
+            ),
+            "{fresh_clone}"
+        );
+
         // A companion package in the project library turns on the
         // uvr::install_uvr() alternative.
         let companion = dir.join(".uvr/library/uvr");
@@ -700,14 +761,8 @@ mod rprofile_tests {
             "Package: uvr\nVersion: 0.0.0\n",
         )
         .unwrap();
-        let original = std::env::var_os("PATH").unwrap_or_default();
-        if !std::env::split_paths(&original).any(|d| d.join("R").is_file()) {
-            eprintln!("skipping: no R on PATH");
-            return;
-        }
-        let without_uvr = path_without_uvr(&original, dir);
 
-        let missing = r_startup_stderr(dir, true, &without_uvr);
+        let missing = r_startup_stderr(dir, &r_bin, &rscript_bin, true, &without_uvr);
         assert!(
             missing.contains(
                 "uvr: uvr command not found. Run uvr::install_uvr(), or install it in a terminal with:\n  curl -fsSL https://raw.githubusercontent.com/nbafrank/uvr/main/install.sh | sh\n"
@@ -717,17 +772,29 @@ mod rprofile_tests {
         assert!(!missing.contains("Error"), "{missing}");
 
         // Rscript (non-interactive) stays silent even without uvr.
-        let batch = r_startup_stderr(dir, false, &without_uvr);
+        let batch = r_startup_stderr(dir, &r_bin, &rscript_bin, false, &without_uvr);
         assert!(!batch.contains("command not found"), "{batch}");
 
-        // A uvr on PATH silences the hint.
+        // A directory named `uvr` on PATH is not a binary; a regular file silences the hint.
+        let dir_clash = dir.join("dir-clash");
+        std::fs::create_dir_all(dir_clash.join("uvr")).unwrap();
+        let with_dir_only = std::env::join_paths(
+            std::iter::once(dir_clash).chain(std::env::split_paths(&without_uvr)),
+        )
+        .unwrap();
+        let still_missing = r_startup_stderr(dir, &r_bin, &rscript_bin, true, &with_dir_only);
+        assert!(
+            still_missing.contains("command not found"),
+            "{still_missing}"
+        );
+
         let bin = dir.join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("uvr"), "").unwrap();
         let with_uvr =
             std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&without_uvr)))
                 .unwrap();
-        let present = r_startup_stderr(dir, true, &with_uvr);
+        let present = r_startup_stderr(dir, &r_bin, &rscript_bin, true, &with_uvr);
         assert!(!present.contains("command not found"), "{present}");
         assert!(present.contains("uvr: library active"), "{present}");
     }

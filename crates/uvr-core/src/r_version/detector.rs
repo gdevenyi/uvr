@@ -331,7 +331,7 @@ fn select_global_pin(installations: &[RInstallation], constraint: Option<&str>) 
     }
     let is_pinned = |inst: &RInstallation| version_matches_prefix(&pin, &inst.version);
     if !installations.iter().any(is_pinned) {
-        if !constraint.is_some_and(|c| pin_conflicts_with_constraint(&pin, c)) {
+        if !constraint.is_some_and(|c| uninstalled_pin_conflicts_with_constraint(&pin, c)) {
             warn(format!(
                 "The global R pin {pin} is not installed, so it is not used. Run \
                  `uvr r install {pin}`, or clear it with `uvr r pin --global --unset`."
@@ -465,6 +465,25 @@ pub fn pin_conflicts_with_constraint(resolved_version: &str, constraint: &str) -
         return false;
     }
     matches!(r_version_satisfies(constraint, resolved_version), Ok(false))
+}
+
+/// Like [`pin_conflicts_with_constraint`], for a pin that is not installed yet.
+/// A two-part pin (`4.5`) stands for any `4.5.z` release, so `>=4.5.1` or
+/// `4.5.3` does not conflict with `4.5` even though `4.5.0` alone would fail it.
+fn uninstalled_pin_conflicts_with_constraint(pin: &str, constraint: &str) -> bool {
+    let parts: Vec<&str> = pin.split('.').collect();
+    if parts.len() != 2 {
+        return pin_conflicts_with_constraint(pin, constraint);
+    }
+    if r_version_satisfies(constraint, "0.0.0").is_err() {
+        return false;
+    }
+    !(0..=99)
+        .chain(std::iter::once(u16::MAX as u32))
+        .any(|patch| {
+            let candidate = format!("{pin}.{patch}");
+            r_version_satisfies(constraint, &candidate).unwrap_or(false)
+        })
 }
 
 /// Compare two version strings with R's semantics: `.` and `-` both separate
@@ -920,5 +939,18 @@ mod tests {
         if !find_all().is_empty() {
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn two_part_uninstalled_pin_does_not_conflict_with_patch_floor() {
+        assert!(!uninstalled_pin_conflicts_with_constraint("4.5", ">=4.5.1"));
+        assert!(!uninstalled_pin_conflicts_with_constraint("4.5", "4.5.3"));
+        assert!(!uninstalled_pin_conflicts_with_constraint("4.5", "==4.5.2"));
+        assert!(uninstalled_pin_conflicts_with_constraint("4.5", ">=4.6"));
+        assert!(uninstalled_pin_conflicts_with_constraint("4.5", "<4.5.0"));
+        assert!(uninstalled_pin_conflicts_with_constraint("4.5", "4.6.1"));
+        assert!(uninstalled_pin_conflicts_with_constraint(
+            "4.5.0", ">=4.5.1"
+        ));
     }
 }

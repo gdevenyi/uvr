@@ -19,9 +19,13 @@ fn uvr_cmd() -> Command {
     ] {
         cmd.env_remove(var);
     }
-    // A developer's real global R pin must not change the results either. This
-    // directory is never created: a test that pins sets its own.
-    let no_config = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-user-config");
+    // A developer's real global R pin must not change the results either. Each
+    // command gets a distinct path so a bare `--global` test cannot affect
+    // parallel tests.
+    static NEXT_NO_CONFIG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT_NO_CONFIG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let no_config = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("no-user-config-{}-{id}", std::process::id()));
     cmd.env("XDG_CONFIG_HOME", &no_config);
     cmd.env("APPDATA", &no_config);
     cmd

@@ -563,8 +563,9 @@ pub enum RCommands {
 #[derive(Debug, Args)]
 pub struct RFindArgs {
     /// R version constraint to satisfy, e.g. ">=4.3" or "4.4.2".
-    /// If omitted, prints the R the current project uses: the `.r-version`
-    /// pin, then the uvr.toml constraint, then the newest installed R.
+    /// If omitted, prints the R the current project uses (`UVR_R_VERSION`,
+    /// `.r-version`, the global pin, the uvr.toml constraint, then the newest
+    /// installed R) and writes the rule that selected it to stderr.
     pub constraint: Option<String>,
 }
 

@@ -108,11 +108,21 @@ pub fn warn_r_pin_mismatch() {
                 .filter(|v| looks_like_exact(v))
                 .map(|v| ("uvr.toml [project] r_version", v.to_string()))
         });
+    let r_constraint = project.manifest.project.r_version.as_deref();
     let Some((pin_label, pinned)) = pin_source else {
+        if let (
+            Some(global_pin),
+            Ok((active_bin, uvr_core::r_version::detector::RSource::GlobalPin)),
+        ) = (
+            uvr_core::project::read_global_r_version_pin(),
+            uvr_core::r_version::detector::find_r_binary_with_source(r_constraint),
+        ) {
+            if let Some(active_ver) = query_r_version(&active_bin) {
+                warn_calling_r_mismatch(&global_pin, "the global R pin", &active_ver);
+            }
+        }
         return;
     };
-
-    let r_constraint = project.manifest.project.r_version.as_deref();
     match find_r_binary(r_constraint) {
         Ok(active_bin) => {
             let Some(active_ver) = query_r_version(&active_bin) else {

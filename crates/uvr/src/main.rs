@@ -373,11 +373,13 @@ fn hint_for(msg: &str) -> Option<String> {
             "The download does not match the SHA-256 pinned in this uvr release, so uvr \
              did not install it: the tarball was tampered with, or GitHub regenerated it. \
              Please report this at https://github.com/nbafrank/uvr/issues. To go on without \
-             the companion, run the command again with --no-companion (or set \
+             the companion, run package commands with --no-companion (or set \
              UVR_NO_COMPANION=1). To install it by hand, use \
              remotes::install_github(\"nbafrank/uvr-r\", lib = .libPaths()[1]); uvr then \
              skips its own download. If this was `uvr init`, the project files are already \
-             written. `uvr import` finished its other steps before this error.",
+             written, so do not run `uvr init` again. If this was `uvr import --lock`, \
+             `uvr add`, or `uvr update`, `uvr.lock` is written; run `uvr sync --no-companion` \
+             to finish installing packages.",
         )
     } else if m.contains("not inside a uvr project") {
         Some("Run `uvr init` to create uvr.toml in this directory.")

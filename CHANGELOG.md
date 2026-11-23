@@ -80,7 +80,8 @@ Pure tracking section — fixes and small features land here between tags.
   now an error, not a warning** (#162). The tarball is pinned to a commit
   and a hash, so a fresh download that does not match means the bytes were
   tampered with (or GitHub regenerated the archive); `uvr init`,
-  `uvr import` and `uvr sync` now stop there and print the URL, the
+  `uvr import`, `uvr sync`, `uvr add`, `uvr update`, and `uvr run --with`
+  now stop there and print the URL, the
   expected and actual hashes, and how to go on with `--no-companion` or
   install the companion from R. A mismatching cached tarball is still
   deleted and downloaded again, and network failures, `R CMD INSTALL` failures

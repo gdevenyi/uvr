@@ -1710,7 +1710,8 @@ fn prune_unused_packages(
 /// settings → different SHA-256. To compute a new hash:
 ///   curl -sL "https://api.github.com/repos/nbafrank/uvr-r/tarball/<sha>" | shasum -a 256
 /// A wrong hash here is loudly fatal: a freshly downloaded tarball that does
-/// not match fails `uvr init`, `uvr import` and `uvr sync` outright (#162).
+/// not match fails `uvr init`, `uvr import`, `uvr sync`, `uvr add`,
+/// `uvr update`, and `uvr run --with` outright (#162).
 const COMPANION_SHA: &str = "f20019c39d8ab16dd360632c0f44b7e6a947162d";
 const COMPANION_HASH: &str = "1bc618215ad80666eea815d88f6bf53ca1c201f7883b970647c96eb18b677ffe";
 
@@ -1788,15 +1789,24 @@ pub fn ensure_companion_package(
         );
         fallback
     });
-    let _ = std::fs::create_dir_all(&cache_dir);
-    let tarball = cache_dir.join(format!("uvr-r-{}.tar.gz", &COMPANION_SHA[..8]));
     let url = format!("https://api.github.com/repos/nbafrank/uvr-r/tarball/{COMPANION_SHA}");
+    ensure_companion_package_from(library, r_binary, &cache_dir, &url)
+}
+
+fn ensure_companion_package_from(
+    library: &std::path::Path,
+    r_binary: &std::path::Path,
+    cache_dir: &std::path::Path,
+    url: &str,
+) -> Result<()> {
+    let _ = std::fs::create_dir_all(cache_dir);
+    let tarball = cache_dir.join(format!("uvr-r-{}.tar.gz", &COMPANION_SHA[..8]));
 
     // Retry once if the first attempt fails with a bad cached tarball or a
     // transient download/install failure.
     let mut last_err: Option<String> = None;
     for attempt in 0..2 {
-        match try_install_companion(library, &tarball, &url, r_binary) {
+        match try_install_companion(library, &tarball, url, r_binary) {
             Ok(()) => {
                 // #60: don't surface the install in the user-facing output —
                 // by the time they see uvr::sync()'s output they've already
@@ -1911,7 +1921,9 @@ fn publish_companion_bytes(
 ) -> std::result::Result<(), CompanionError> {
     verify_companion_bytes(bytes, expected, true)?;
     let dir = tarball.parent().unwrap_or(std::path::Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".uvr-dl-")
+        .tempfile_in(dir)?;
     std::io::Write::write_all(&mut tmp, bytes)?;
     tmp.persist(tarball).map_err(|e| e.error)?;
     Ok(())
@@ -2842,41 +2854,6 @@ fn source_url(pkg: &LockedPackage, bioc_release: Option<&str>) -> String {
 }
 
 #[cfg(test)]
-mod companion_cache_tests {
-    use super::*;
-    use sha2::{Digest, Sha256};
-
-    #[test]
-    fn publish_companion_bytes_writes_only_verified_bytes() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let tarball = tmp.path().join("uvr-r.tar.gz");
-
-        // A bad download leaves no file behind, and no temporary file.
-        let err = publish_companion_bytes(b"bad", &tarball, "0000").unwrap_err();
-        assert!(matches!(
-            err,
-            CompanionError::ChecksumMismatch { fresh: true, .. }
-        ));
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
-
-        let hash: &'static str = hex::encode(Sha256::digest(b"good")).leak();
-        publish_companion_bytes(b"good", &tarball, hash).unwrap();
-        assert_eq!(std::fs::read(&tarball).unwrap(), b"good");
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn publish_companion_bytes_keeps_a_tarball_from_another_process() {
-        // #162: the failed check must not touch what another uvr published.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let tarball = tmp.path().join("uvr-r.tar.gz");
-        std::fs::write(&tarball, b"theirs").unwrap();
-        assert!(publish_companion_bytes(b"bad", &tarball, "0000").is_err());
-        assert_eq!(std::fs::read(&tarball).unwrap(), b"theirs");
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use uvr_core::lockfile::{LockedPackage, Lockfile, PackageSource, RVersionPin};
@@ -3724,6 +3701,116 @@ mod tests {
             matches!(err, CompanionError::ChecksumMismatch { fresh: false, .. }),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn publish_companion_bytes_writes_only_verified_bytes() {
+        use sha2::{Digest, Sha256};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tarball = tmp.path().join("uvr-r.tar.gz");
+
+        let err = publish_companion_bytes(b"bad", &tarball, "0000").unwrap_err();
+        assert!(matches!(
+            err,
+            CompanionError::ChecksumMismatch { fresh: true, .. }
+        ));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+
+        let hash: &'static str = hex::encode(Sha256::digest(b"good")).leak();
+        publish_companion_bytes(b"good", &tarball, hash).unwrap();
+        assert_eq!(std::fs::read(&tarball).unwrap(), b"good");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn publish_companion_bytes_keeps_a_tarball_from_another_process() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tarball = tmp.path().join("uvr-r.tar.gz");
+        std::fs::write(&tarball, b"theirs").unwrap();
+        assert!(publish_companion_bytes(b"bad", &tarball, "0000").is_err());
+        assert_eq!(std::fs::read(&tarball).unwrap(), b"theirs");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn ensure_companion_package_loop_handles_fresh_mismatch_corrupt_cache_and_offline() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let serve = |body: &'static [u8]| -> (String, Arc<AtomicUsize>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_bg = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                while let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    hits_bg.fetch_add(1, Ordering::SeqCst);
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.write_all(body);
+                }
+            });
+            (format!("http://127.0.0.1:{port}/tarball"), hits)
+        };
+
+        // 1. Fresh download mismatch stops on attempt 1 without a retry.
+        let lib = tempfile::TempDir::new().unwrap();
+        let cache = tempfile::TempDir::new().unwrap();
+        let (url, hits) = serve(b"tampered-bytes");
+        let err = ensure_companion_package_from(
+            lib.path(),
+            std::path::Path::new("/nonexistent/R"),
+            cache.path(),
+            &url,
+        )
+        .unwrap_err();
+        let full = format!("{err:#}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(
+            full.contains("companion package download failed its SHA-256 check"),
+            "{full}"
+        );
+        assert!(full.contains(&url), "{full}");
+        assert!(full.contains(COMPANION_HASH), "{full}");
+
+        // 2. Corrupt cached tarball deletes the cache file and retries once.
+        let cache2 = tempfile::TempDir::new().unwrap();
+        let cached_tar = cache2
+            .path()
+            .join(format!("uvr-r-{}.tar.gz", &COMPANION_SHA[..8]));
+        std::fs::write(&cached_tar, b"corrupt-cache").unwrap();
+        let (url2, hits2) = serve(b"tampered-on-retry");
+        let err2 = ensure_companion_package_from(
+            lib.path(),
+            std::path::Path::new("/nonexistent/R"),
+            cache2.path(),
+            &url2,
+        )
+        .unwrap_err();
+        assert_eq!(hits2.load(Ordering::SeqCst), 1);
+        assert!(!cached_tar.exists());
+        assert!(format!("{err2:#}").contains(&url2));
+
+        // 3. Transport failure retries once, warns, and returns Ok(()).
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let cache3 = tempfile::TempDir::new().unwrap();
+        let res = ensure_companion_package_from(
+            lib.path(),
+            std::path::Path::new("/nonexistent/R"),
+            cache3.path(),
+            &format!("http://127.0.0.1:{closed_port}/tarball"),
+        );
+        assert!(res.is_ok(), "{res:?}");
     }
 
     #[test]

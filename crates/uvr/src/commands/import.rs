@@ -245,21 +245,6 @@ pub async fn run(
             }
         }
     }
-    // Returned last: a companion that fails its checksum (#162) must not skip
-    // the renv cleanup, or `--lock`.
-    let mut companion = Ok(());
-    if !manifest.project.bare && !uvr_core::env_vars::no_companion() {
-        if let Ok(r_binary) = find_r_binary(manifest.project.r_version.as_deref()) {
-            if let Some(r_ver) = query_r_version(&r_binary) {
-                companion = crate::commands::sync::ensure_companion_package(
-                    &library_path,
-                    &r_ver,
-                    &r_binary,
-                );
-            }
-        }
-    }
-
     // Handle leftover renv plumbing. The renv project layout puts a
     // `source("renv/activate.R")` hook into `.Rprofile`, which resets
     // `.libPaths()` to `renv/library/...` at every R startup —
@@ -334,9 +319,23 @@ pub async fn run(
             "Run {} to resolve and install packages",
             palette::bold("uvr lock && uvr sync"),
         ));
+        // Run last when `!lock` so a checksum failure (#162) never skips renv
+        // cleanup or the summary above; `--lock` already installs the companion
+        // once inside `install_from_lockfile`.
+        if !manifest.project.bare && !uvr_core::env_vars::no_companion() {
+            if let Ok(r_binary) = find_r_binary(manifest.project.r_version.as_deref()) {
+                if let Some(r_ver) = query_r_version(&r_binary) {
+                    crate::commands::sync::ensure_companion_package(
+                        &library_path,
+                        &r_ver,
+                        &r_binary,
+                    )?;
+                }
+            }
+        }
     }
 
-    companion
+    Ok(())
 }
 
 // ─── renv leftover detection + cleanup ─────────────────────────────

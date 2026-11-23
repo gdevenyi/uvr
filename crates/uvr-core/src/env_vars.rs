@@ -318,17 +318,22 @@ pub fn user_profile() -> bool {
 /// relative value would load the `.Rprofile` that the tarball ships, or no
 /// profile.
 pub fn r_profile_user() -> PathBuf {
-    // R for Windows takes `~` from R_USER, then HOME, then Documents — not
-    // the profile directory `dirs::home_dir()` returns there.
+    // R for Windows takes `~` from R_USER, then HOME, then Documents, then
+    // HOMEDRIVE+HOMEPATH (when Documents is absent, such as headless containers).
     let r_home_dir = if cfg!(windows) {
         read_env_var("R_USER")
             .or_else(|| read_env_var("HOME"))
             .map(PathBuf::from)
             .or_else(dirs::document_dir)
+            .or_else(dirs::home_dir)
     } else {
         dirs::home_dir()
     };
     r_profile_user_in(r_home_dir)
+}
+
+fn is_uvr_project_rprofile(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|s| s.contains("# >>> uvr >>>"))
 }
 
 /// [`r_profile_user`] with the home directory passed in, so tests need not
@@ -338,22 +343,45 @@ fn r_profile_user_in(r_home_dir: Option<PathBuf>) -> PathBuf {
     if !user_profile() {
         return null_device;
     }
-    if let Some(own) = read_env_var("R_PROFILE_USER") {
-        let tilde = own.starts_with('~');
-        let own = PathBuf::from(own);
-        if tilde || own.is_absolute() {
-            return own;
+    if let Ok(own) = std::env::var("R_PROFILE_USER") {
+        // In R (`?Startup`), `R_PROFILE_USER=""` turns off user profiles.
+        if own.trim().is_empty() {
+            return null_device;
         }
-        return std::env::current_dir()
-            .map(|cwd| cwd.join(&own))
-            .unwrap_or(own);
+        if let Some(rel) = own
+            .strip_prefix("~/")
+            .or_else(|| cfg!(windows).then(|| own.strip_prefix("~\\")).flatten())
+        {
+            if r_home_dir
+                .as_ref()
+                .is_some_and(|h| is_uvr_project_rprofile(&h.join(rel)))
+            {
+                return null_device;
+            }
+            return PathBuf::from(own);
+        }
+        if own.starts_with('~') {
+            return PathBuf::from(own);
+        }
+        let own = PathBuf::from(own);
+        let anchored = if own.is_absolute() {
+            own
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&own))
+                .unwrap_or(own)
+        };
+        if is_uvr_project_rprofile(&anchored) {
+            return null_device;
+        }
+        return anchored;
     }
     r_home_dir
         .map(|h| h.join(".Rprofile"))
         .filter(|p| p.is_file())
         // A project in the home directory: this file is the project's, and
         // its block would put the project library ahead of a script's own.
-        .filter(|p| !std::fs::read_to_string(p).is_ok_and(|s| s.contains("# >>> uvr >>>")))
+        .filter(|p| !is_uvr_project_rprofile(p))
         .unwrap_or(null_device)
 }
 
@@ -626,12 +654,21 @@ mod tests {
         // left for each R child to resolve against its own.
         env::set_var("R_PROFILE_USER", "omp.Rprofile");
         assert_eq!(resolve(), env::current_dir().unwrap().join("omp.Rprofile"));
+        // Empty R_PROFILE_USER disables user profiles in R (?Startup).
+        env::set_var("R_PROFILE_USER", "");
+        assert_eq!(resolve(), null_device);
         env::remove_var("R_PROFILE_USER");
 
         // Opted in, but `~/.Rprofile` holds uvr's block (a project in the home
-        // directory): it is the project's profile, so not this one.
+        // directory): it is the project's profile, so not this one — even when
+        // R_PROFILE_USER names it explicitly.
         std::fs::write(&profile, "# >>> uvr >>>\n# <<< uvr <<<\n").unwrap();
         assert_eq!(resolve(), null_device);
+        env::set_var("R_PROFILE_USER", profile.to_str().unwrap());
+        assert_eq!(resolve(), null_device);
+        env::set_var("R_PROFILE_USER", "~/.Rprofile");
+        assert_eq!(resolve(), null_device);
+        env::remove_var("R_PROFILE_USER");
 
         // Opted in, but no profile to load: still the null device, never
         // unset (R would fall back to the project's `./.Rprofile`).

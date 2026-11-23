@@ -106,22 +106,24 @@ pub fn make_aggregate_bar(total: u64) -> ProgressBar {
     }
     let pb = ProgressBar::new(total);
     apply_draw_target(&pb, mode);
+    pb.set_style(aggregate_bar_style());
+    pb.enable_steady_tick(std::time::Duration::from_secs(1));
+    pb
+}
+
+fn aggregate_bar_style() -> ProgressStyle {
     let tmpl = format!(
         "  {{bar:28.cyan/blue.dim}} {{pos:>3}}/{{len}} {sep} {{elapsed_precise}} {sep} {{msg:.dim}}",
         sep = glyph::bullet(),
     );
-    pb.set_style(
-        ProgressStyle::with_template(&tmpl)
-            .unwrap()
-            .progress_chars(&format!(
-                "{}{}{}",
-                glyph::bar_filled(),
-                glyph::bar_filled(),
-                glyph::bar_empty()
-            )),
-    );
-    pb.enable_steady_tick(std::time::Duration::from_secs(1));
-    pb
+    ProgressStyle::with_template(&tmpl)
+        .unwrap()
+        .progress_chars(&format!(
+            "{}{}{}",
+            glyph::bar_filled(),
+            glyph::bar_filled(),
+            glyph::bar_empty()
+        ))
 }
 
 // Touch `palette` to keep the module graph explicit — this file is the only
@@ -132,4 +134,14 @@ pub fn make_aggregate_bar(total: u64) -> ProgressBar {
 #[allow(dead_code)]
 fn _palette_anchor() -> console::Style {
     palette::style_for(palette::Role::Info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aggregate_bar_style;
+
+    #[test]
+    fn aggregate_bar_template_parses() {
+        let _ = aggregate_bar_style();
+    }
 }

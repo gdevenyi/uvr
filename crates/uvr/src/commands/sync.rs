@@ -904,7 +904,7 @@ async fn install_from_lockfile_with_r(
         .chain(project.manifest.sources.iter().cloned())
         .collect();
 
-    let mut p3m_index_available = false;
+    let mut binary_index_available = false;
     let plans: Vec<PkgPlan> = if cache_misses.iter().any(|p| !is_local(p)) {
         // Re-fetch each [[sources]] (HTTP-cached → 304 normally) and partition
         // into binary-capable vs. source-only. A registry is "binary-capable"
@@ -960,7 +960,8 @@ async fn install_from_lockfile_with_r(
             }
             None
         };
-        p3m_index_available = p3m.as_ref().is_some_and(|index| !index.is_empty());
+        binary_index_available =
+            !custom_binary.is_empty() || p3m.as_ref().is_some_and(|index| !index.is_empty());
 
         cache_misses
             .iter()
@@ -1165,20 +1166,35 @@ async fn install_from_lockfile_with_r(
             }
         }
 
-        // "No binary repo" hint — only fires when no packages were binary and at
-        // least one real source build (compilation) is needed. Pure-R alone doesn't
-        // indicate "no binaries available" — those packages simply have no binary form.
-        // Path packages are always built from their directory, so they say
-        // nothing about binary availability.
-        let remote_source =
-            runtime_source.saturating_sub(plans.iter().filter(|p| is_local(p.pkg)).count());
+        // "No binary repo" hint — only fires when binaries were allowed, no
+        // packages were binary, and at least one registry source build
+        // (compilation) is needed. Pure-R, path, Git, and URL packages have no
+        // binary repo form, and `--no-binary` already explained why it builds
+        // from source.
+        let registry_source = plans
+            .iter()
+            .zip(&detected_per_plan)
+            .filter(|(p, k)| {
+                **k == InstallKind::Source
+                    && matches!(
+                        p.pkg.source,
+                        uvr_core::lockfile::PackageSource::Cran
+                            | uvr_core::lockfile::PackageSource::Bioconductor
+                            | uvr_core::lockfile::PackageSource::Custom { .. }
+                    )
+            })
+            .count();
         // A binary plan means a repo exists; it just served source (#225).
-        if runtime_binary == 0 && remote_source > 0 && !plans.iter().any(|p| p.is_binary) {
+        if !force_source
+            && runtime_binary == 0
+            && registry_source > 0
+            && !plans.iter().any(|p| p.is_binary)
+        {
             ui::line(source_build_hint(
                 &host_info.distro_label,
                 &r_minor_str,
-                remote_source,
-                p3m_index_available,
+                registry_source,
+                binary_index_available,
             ));
         }
 
@@ -1535,7 +1551,7 @@ async fn install_from_lockfile_with_r(
                         .install_streaming(source_path, &library, &plan.pkg.name, timeout, |line| {
                             let short = shorten_build_line(line);
                             pb_for_closure
-                                .set_message(format!("compiling {name} {version} ({short})"));
+                                .set_message(format!("{verb} {name} {version} ({short})"));
                         })
                         .with_context(|| format!("Failed to install {}", plan.pkg.name))?;
                 }

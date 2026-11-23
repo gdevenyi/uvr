@@ -81,7 +81,7 @@ Pure tracking section — fixes and small features land here between tags.
   the Archive's answer, a 404 for a current release, and hid the cause. Now
   it gives both. A request that cannot connect (a refused connection or a
   connect timeout) is tried up to three times, for package downloads and for
-  a first `PACKAGES.gz` fetch.
+  a full `PACKAGES.gz` fetch.
 
 ## v0.4.8 (2026-10-22)
 

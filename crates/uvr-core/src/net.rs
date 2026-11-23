@@ -30,7 +30,10 @@ where
     for attempt in 1..ATTEMPTS {
         match send().await {
             Err(e) if e.is_connect() => {
-                tracing::debug!("connect failed (attempt {attempt} of {ATTEMPTS}): {e}");
+                tracing::debug!(
+                    "connect failed (attempt {attempt} of {ATTEMPTS}): {}",
+                    format_connect_error(&e)
+                );
                 tokio::time::sleep(delay).await;
                 delay *= 2;
             }
@@ -40,9 +43,17 @@ where
     send().await
 }
 
+fn format_connect_error(err: &reqwest::Error) -> String {
+    let text = crate::error::describe_network_error(err);
+    match err.url() {
+        Some(url) => text.replace(url.as_str(), &crate::auth::redact_url(url.as_str())),
+        None => text,
+    }
+}
+
 #[cfg(all(test, not(target_os = "windows")))]
 mod tests {
-    use super::retry_connect;
+    use super::{format_connect_error, retry_connect};
     use crate::auth::{test_response, test_server};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -58,12 +69,43 @@ mod tests {
         let tries = AtomicU32::new(0);
         let err = retry_connect(|| {
             tries.fetch_add(1, Ordering::SeqCst);
-            client.get(format!("http://127.0.0.1:{port}/")).send()
+            client
+                .get(format!("http://user:secret@127.0.0.1:{port}/"))
+                .send()
         })
         .await
         .unwrap_err();
         assert!(err.is_connect(), "{err}");
         assert_eq!(tries.load(Ordering::SeqCst), 3);
+        let formatted = format_connect_error(&err);
+        assert!(!formatted.contains("secret"), "{formatted}");
+        assert!(formatted.contains("Connect"), "{formatted}");
+    }
+
+    #[tokio::test]
+    async fn a_transient_connect_failure_recovers_on_the_next_attempt() {
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (live_url, seen) = test_server(|_| test_response("200 OK", "", b"ok"));
+        let client = reqwest::Client::new();
+        let tries = AtomicU32::new(0);
+        let resp = retry_connect(|| {
+            let n = tries.fetch_add(1, Ordering::SeqCst);
+            let target = if n == 0 {
+                format!("http://127.0.0.1:{closed_port}/")
+            } else {
+                live_url.clone()
+            };
+            client.get(target).send()
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(tries.load(Ordering::SeqCst), 2);
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -379,9 +379,11 @@ async fn download_one(
         });
     // The Archive retry's own failure, kept beside the first one: the
     // Archive answers 404 for a current release, so on its own it hides
-    // why the first request failed (#332).
+    // why the first request failed (#332). Skip the Archive when the host
+    // itself could not connect: `cran_archive_url` shares the same host
+    // and `retry_connect` already tried it three times.
     let mut archive_error = None;
-    if resp_result.is_err() {
+    if resp_result.as_ref().err().is_some_and(|e| !e.is_connect()) {
         if let Some(archive_url) = cran_archive_url(url) {
             debug!(
                 "{name}: {} failed, retrying via CRAN Archive: {}",
@@ -1127,6 +1129,24 @@ mod tests {
             assert!(archive.contains("404 Not Found"), "{err}");
             assert!(archive.contains("/Archive/a/a_1.0.tar.gz"), "{err}");
             assert_eq!(seen.lock().unwrap().len(), 2, "primary + Archive retry");
+        }
+
+        #[tokio::test]
+        async fn a_connect_failure_skips_the_archive_retry() {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let err = fetch(
+                &format!("http://127.0.0.1:{port}/src/contrib/a_1.0.tar.gz"),
+                &[],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(!err.contains("CRAN Archive retry"), "{err}");
+            assert!(err.starts_with("Network error:"), "{err}");
         }
 
         #[tokio::test]

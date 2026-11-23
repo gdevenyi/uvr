@@ -96,7 +96,7 @@ pub type Result<T> = std::result::Result<T, UvrError>;
 ///
 /// Certificate failures additionally get a pointer to the fix, since
 /// "unknown issuer" is not self-explanatory to most users.
-fn describe_network_error(err: &reqwest::Error) -> String {
+pub(crate) fn describe_network_error(err: &reqwest::Error) -> String {
     // Depth cap: the chain comes from the local networking stack rather
     // than remote input, so this is belt-and-braces, not a live risk.
     const MAX_DEPTH: usize = 8;
